@@ -1,0 +1,41 @@
+{
+  "seed": 5574668987006270653,
+  "function": "gaussian_wind",
+  "speed_std_m_s": 0.5,
+  "direction_std_deg": 3.0,
+  "numpy_bit_generator": "PCG64",
+  "source_case": "/Users/aaronbenedek/Documents/AME505_project_new/AME-505-Group-6-Turbines/OFF/02_Examples_and_Cases/02_Example_Cases/001_two_turbines_yaw_step_floris.yaml",
+  "observation_coordinates_m": [
+    [
+      0.0,
+      -495.0,
+      119.0
+    ],
+    [
+      990.0,
+      -495.0,
+      119.0
+    ],
+    [
+      1980.0,
+      -495.0,
+      119.0
+    ],
+    [
+      0.0,
+      495.0,
+      119.0
+    ],
+    [
+      990.0,
+      495.0,
+      119.0
+    ],
+    [
+      1980.0,
+      495.0,
+      119.0
+    ]
+  ],
+  "note": "Ambient feed times are shifted back one tick to match OFF's correction order."
+}
