@@ -1,0 +1,56 @@
+
+name: turbine array
+description: Nine turbine case with DTU 10 MW turbines in a 3x3 grid with 900m distance
+
+farm:
+  layout_x:
+    - 600.0
+    - 1500.0
+    - 2400.0
+    - 600.0
+    - 1500.0
+    - 2400.0
+    - 600.0
+    - 1500.0
+    - 2400.0
+  layout_y:
+    - 2400.0
+    - 2400.0
+    - 2400.0
+    - 1500.0
+    - 1500.0
+    - 1500.0
+    - 600.0
+    - 600.0
+    - 600.0
+  layout_z:
+    - 0.0
+    - 0.0
+    - 0.0
+    - 0.0
+    - 0.0
+    - 0.0
+    - 0.0
+    - 0.0
+    - 0.0
+  turbine_type:
+    - dtu_10mw
+    - dtu_10mw
+    - dtu_10mw
+    - dtu_10mw
+    - dtu_10mw
+    - dtu_10mw
+    - dtu_10mw
+    - dtu_10mw
+    - dtu_10mw
+  unit:
+    - m
+  diameter: # Only needed if unit was set to D
+    - 178.3
+  boundaries_xyz:
+    - 0.0
+    - 3000.0
+    - 0.0
+    - 3000.0
+    - 0.0
+    - 400.0

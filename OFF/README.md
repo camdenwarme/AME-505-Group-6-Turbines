@@ -1,0 +1,96 @@
+<p align="center">
+  <img width="880" height="240" src="https://github.com/TUDelft-DataDrivenControl/OFF/blob/main/99_Design/01_Logo/OFF_Logo_wide_maintenance.png">
+</p>
+
+# OFF
+Welcome to the working repo for a dynamic parametric wake toolbox that combines and connects OnWaRDS, FLORIDyn, and FLORIS (OFF).
+## Purpose
+The OFF toolbox is meant to provide one interface to dynamic parametric wake modelling. The goal is to enable testing of different approaches, comparisons using the same interface and an environment to develop new approaches.
+
+## Development
+> OFF is under maintenance! We are working under the hood on a better interface and internal structure of the model.
+The goal is to simplify the installation of the model, improve performance, make it easier to extend, add more examples, and much more.
+
+> However, for these changes to happen, we may need to make some braking changes. This may mean that the code you wrote may not work with future versions anymore, and that additions you made may not fit anymore. If you have code additions, create a pull request and we'll try to merge them asap. If you have wishes for the model, create an issue.
+
+### Current state
+So what can you expect today?
+The toolbox allows you to run dynamic wind farm simulations using a prescribed (uniform) flow field. The code uses an implementation of the FLORIDyn-framework \[1\], which then interfaces to the FLORISv4 model \[2\].
+
+*Current degrees of design-freedom include:*
+- The flow field can change uniformly in direction and speed, 
+- within FLORISv4 different wake models can be selected, 
+- the number and location of turbines can be altered,
+- Wake steering control is available
+
+*Current limitations include:*
+- Heterogeneous flow field behaviour is not included, 
+- There is only one dynamic solver which cannot be changed
+  -  OnWaRDS \[3\] approach not yet impemented
+  -  Particle model and behaviour not yet changable
+
+*Features include:*
+- Logging
+- There is an [auto-documentation framework](https://tudelft-datadrivencontrol.github.io/OFF/)
+- UML diagram of the code
+- Measurements are stored in run-folders
+- Preliminary effective wind speed flow field plots are possible
+
+### Current development focus
+1. Features
+  - Implement a low-level controller for induction control
+  - Reference cases
+  - Floating wind turbines
+  - Reference optimization workflow
+  - Connect to other steady-state wake solvers (e.g., PyWake)
+  - Implement OnWaRDS approach
+  - Computational performance
+  - Input flow field data (heterogeneous flow)
+2. User-friendliness
+  - Code refactoring for a better overview
+  - Improved flow field plotting 
+  - Complete the "Interactive Simulation Assembly"
+  - Communicate back what model has been used and under which conditions (Report)
+
+### Longterm vision
+FLORIDyn and OnWaRDS are hopefully only the start of creating a transparent toolbox to explore dynamic parametric wake modeling choices. We therefore plan to implement more model-design decisions and allow a simple, automatable change of them.
+
+## Contributing
+Fork branch commit push pull!
+**We do explicitly encourage the interested developers to engage and also to add their ideas and code to the toolbox.**
+The Git is also meant as a place to discuss and propose new changes.
+
+## How to run a simulation
+Run the `main.py` in the 03_Code folder.
+
+To change the simulation, you have to change the .yaml file OFF calls. This is defined by one of the first limes of code in the main function. The .yaml structure is showed in `02_Examples_and_Cases/02_Example_Cases/run_example.yaml` . This is where you can change the wind farm layout, the flow conditions, the wake model etc.
+
+A thorough description of the code is available [here](https://tudelft-datadrivencontrol.github.io/OFF/). The documentation is handled automatically using Sphinx.
+
+## How to cite
+If OFF has played a role in your work, please cite the following [publication](https://wes.copernicus.org/articles/10/1055/2025/):
+
+```
+@Article{wes-10-1055-2025,
+  AUTHOR = {Becker, M. and Lejeune, M. and Chatelain, P. and Allaerts, D. and Mudafort, R. and van Wingerden, J.-W.},
+  TITLE = {A dynamic open-source model to investigate wake dynamics in response to wind farm flow control strategies},
+  JOURNAL = {Wind Energy Science},
+  VOLUME = {10},
+  YEAR = {2025},
+  NUMBER = {6},
+  PAGES = {1055--1075},
+  URL = {https://wes.copernicus.org/articles/10/1055/2025/},
+  DOI = {10.5194/wes-10-1055-2025}
+}
+```
+
+
+## Developers and sources
+### Developers
+Marcus Becker (TU Delft) and Maxime Lejeune (UCLouvain/VKI) are the core developers of the OFF toolbox. Leendert Starink (TU Delft) is working on a floating turbine implementation.
+### Sources
+\[1\] FLORIDyn - A dynamic and flexible framework for real-time wind farm control, M. Becker, D. Allaerts, J.W. van Wingerden, 2022 J. Phys.: Conf. Ser. 2265(2022) 032103
+
+\[2\] FLORIS Wake Modeling and Wind Farm Controls Software, National Renewable Energy Laboratory, 2024, GitHub
+
+\[3\] A Meandering-Capturing Wake Model Coupled to Rotor-Based Flow-Sensing for Operational Wind Farm Flow Prediction, M. Lejeune, M. Moens, P. Chatelain, 2022 Front. Energy Res., Sec. Wind Energy

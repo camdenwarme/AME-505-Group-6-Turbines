@@ -1,0 +1,6 @@
+-r "requirements (1).txt"
+torch>=2.0
+gym==0.26.2
+tensorboardX>=2.6
+imageio>=2.30
+imageio-ffmpeg>=0.4
