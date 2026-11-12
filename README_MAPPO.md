@@ -91,11 +91,11 @@ not twice for the two agents. Evaluation episodes are excluded from this trainin
 CSV and from cumulative training energy. Elapsed wall time includes evaluations.
 
 At the end of a successful run, `cumulative_energy_by_episode.png` is saved next
-to the CSV. Its top panel plots the total energy generated within each episode,
-with a tightly fitted y-axis to reveal changes between episodes. Its bottom panel
-plots the running cumulative energy across all training episodes. Both use MWh
-and episode number. This distinguishes fluctuations in episode performance from
-the steadily increasing total across training. Axis limits include 12% padding
+to the CSV. It plots each episode's final cumulative energy (the total generated
+within that episode, using `episode_energy_mwh`) against episode number. Energy
+resets at the start of every episode; the plot does not sum energy across training
+episodes. Its tightly fitted y-axis reveals fluctuations in episode performance.
+Axis limits include 12% padding
 around the observed range, with a fallback for constant or single-episode data.
 Regenerate the plot for an existing CSV using:
 `python plot_training_energy.py <run-folder>`.
