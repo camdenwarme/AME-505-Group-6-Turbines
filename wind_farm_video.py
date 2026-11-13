@@ -162,7 +162,9 @@ def record_policy_video(env, policies, output_path, fps=None, episode=None):
                     action, states[i] = policy.act(obs[i:i + 1], states[i], mask, deterministic=True)
                     actions.append(action.detach().cpu().numpy()[0])
                 obs, rewards, dones, infos = env.step(np.stack(actions))
-                reward_history.append(float(rewards[0, 0]))
+                # The environment now returns turbine-specific rewards; plots
+                # labeled as farm reward must use the separately reported team value.
+                reward_history.append(float(infos[0]["team_reward"]))
                 energy_history.append(float(infos[0]["episode_energy_j"]))
                 observations.append(obs.copy())
                 times.append((step + 1) * env.dt)

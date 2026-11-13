@@ -1,6 +1,8 @@
 """Train the two-turbine environment using an adjacent light_mappo checkout."""
 
 import argparse
+import csv
+from importlib import metadata
 import json
 from pathlib import Path
 import sys
@@ -16,6 +18,14 @@ def main():
     bootstrap.add_argument("--dt", type=float, default=4.0)
     bootstrap.add_argument("--video-fps", type=float, default=None,
                            help="Override playback FPS; default is 10 / dt (10x simulation speed).")
+    bootstrap.add_argument("--no-video", action="store_true",
+                           help="Run numeric evaluations without rendering videos.")
+    bootstrap.add_argument("--evaluate-aligned-baseline", action="store_true",
+                           help="Also simulate an aligned reference during evaluation.")
+    bootstrap.add_argument("--numeric-eval-interval", type=int, default=10,
+                           help="Evaluate the greedy policy after this many completed episodes.")
+    bootstrap.add_argument("--team-reward-weight", type=float, default=0.5,
+                           help="Weight of the farm advantage in each actor update, from 0 to 1.")
     integration, _ = bootstrap.parse_known_args()
     mappo = integration.mappo_path.resolve()
     if not (mappo / "config.py").is_file():
@@ -34,18 +44,28 @@ def main():
     parser.set_defaults(env_name="windfarm", experiment_name="two_turbines",
                         num_env_steps=20000, episode_length=200, n_rollout_threads=1,
                         n_eval_rollout_threads=1, gamma=1.0,
-                        use_feature_normalization=False)
+                        use_feature_normalization=False, use_valuenorm=False,
+                        lr=3.5e-4, critic_lr=3.5e-4,
+                        ppo_epoch=10)
     args = parser.parse_args()
     # Separate actors need no extra agent identity in the local observation.
     args.num_agents, args.share_policy, args.scenario_name = 2, False, "two_turbines"
     if not args.use_centralized_V:
         parser.error("The turbine setup requires a shared centralized critic.")
+    if args.use_popart or args.use_valuenorm:
+        parser.error("Horizon-scaled farm values use per-horizon loss scaling, not PopArt or ValueNorm.")
     if args.n_rollout_threads != 1 or args.use_eval:
         parser.error("This minimal integration supports one training environment and no --use_eval.")
     if args.episode_length < 1 or args.num_env_steps < args.episode_length:
         parser.error("num_env_steps must cover at least one positive-length episode.")
     if args.video_fps is not None and (not np.isfinite(args.video_fps) or args.video_fps <= 0):
         parser.error("video-fps must be positive.")
+    if not np.isfinite(args.team_reward_weight) or not 0 <= args.team_reward_weight <= 1:
+        parser.error("team-reward-weight must be between 0 and 1.")
+    if not np.isfinite(args.gamma) or not 0 <= args.gamma <= 1:
+        parser.error("gamma must be between 0 and 1.")
+    if args.numeric_eval_interval < 1:
+        parser.error("numeric-eval-interval must be positive.")
     recurrent = args.use_recurrent_policy or args.use_naive_recurrent_policy
     if (args.algorithm_name == "rmappo") != recurrent:
         parser.error("Use --algorithm_name rmappo with a recurrent-policy flag, or mappo without one.")
@@ -65,6 +85,10 @@ def main():
     run_dir = run_dir / (datetime.now().strftime("%Y%m%d_%H%M%S_") + uuid.uuid4().hex[:8])
     run_dir.mkdir()
     (run_dir / "config.json").write_text(json.dumps(vars(args), default=str, indent=2))
+    versions = {"python": sys.version}
+    for package in ("floris", "numpy", "torch", "gym", "tensorboardX"):
+        versions[package] = metadata.version(package)
+    (run_dir / "runtime_versions.json").write_text(json.dumps(versions, indent=2))
 
     env = WindFarmEnv(args.episode_length, integration.dt, integration.wind_speed,
                       integration.wind_direction)
@@ -72,17 +96,37 @@ def main():
     envs = DummyVecEnv([lambda: env])
 
     def record_evaluation(episode, policies):
-        from wind_farm_video import record_policy_video
+        from evaluate_wind_farm import evaluate_episode
         # Separate simulator: evaluation must not reset the training environment
         # or invalidate the observations/recurrent states carried in its buffer.
         evaluation_env = WindFarmEnv(args.episode_length, integration.dt,
                                      integration.wind_speed, integration.wind_direction)
         try:
             evaluation_env.seed(args.seed)
-            video = record_policy_video(evaluation_env, policies,
-                                        run_dir / f"wind_farm_episode{episode}.mp4",
-                                        args.video_fps, episode=episode)
-            print(f"Evaluation (greedy policy, no exploration) after {episode} training episodes: {video}", flush=True)
+            # A physically simulated aligned benchmark is optional; individual
+            # GAE baseline values are computed analytically without that rollout.
+            records = []
+            if episode == 0 and args.evaluate_aligned_baseline:
+                records.append({"episode": episode, "policy": "aligned_baseline",
+                                **evaluate_episode(evaluation_env)})
+            records.append({"episode": episode, "policy": "greedy",
+                            **evaluate_episode(evaluation_env, policies)})
+            path = run_dir / "evaluation_metrics.csv"
+            new_file = not path.exists()
+            with path.open("a", newline="", encoding="utf-8") as stream:
+                writer = csv.DictWriter(stream, fieldnames=list(records[0]))
+                if new_file:
+                    writer.writeheader()
+                writer.writerows(records)
+            for record in records:
+                print(f"Evaluation episode {episode} {record['policy']}: "
+                      f"{record['farm_energy_mwh']:.6f} MWh", flush=True)
+            if not args.no_video:
+                from wind_farm_video import record_policy_video
+                video = record_policy_video(evaluation_env, policies,
+                                            run_dir / f"wind_farm_episode{episode}.mp4",
+                                            args.video_fps, episode=episode)
+                print(f"Evaluation video: {video}", flush=True)
         finally:
             evaluation_env.close()
 
@@ -98,9 +142,13 @@ def main():
         print(f"Training loss plot: {plot_training_loss(runner.metrics_path)}", flush=True)
         from plot_rewards import plot_reward_summary
         print(f"Episode reward plot: {plot_reward_summary(run_dir)}", flush=True)
+        from plot_training_diagnostics import make_diagnostics
+        diagnostics_plot, diagnostics_summary = make_diagnostics(run_dir)
+        print(f"Training diagnostics: {diagnostics_plot} and {diagnostics_summary}", flush=True)
         from training_report import write_training_report, write_evaluation_state_report
         print(f"Training plots report: {write_training_report(run_dir)}", flush=True)
-        print(f"Evaluation report: {write_evaluation_state_report(run_dir)}", flush=True)
+        if not args.no_video:
+            print(f"Evaluation report: {write_evaluation_state_report(run_dir)}", flush=True)
     finally:
         envs.close()
         if runner is not None:

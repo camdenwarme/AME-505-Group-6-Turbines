@@ -7,6 +7,7 @@ Positive rates increase absolute heading, matching FDynSim's convention.
 """
 
 from contextlib import contextmanager, redirect_stdout
+from importlib import resources
 import io
 import logging
 import os
@@ -47,6 +48,11 @@ class _YawRateController:
 
 class WindFarmEnv:
     num_agent = 2
+    # OFF keeps a chain of previous turbine states used to construct wakes.
+    # Fixed lag samples give the centralized critic some wake context without
+    # exposing the changing-length simulator chain to the decentralized actors.
+    critic_yaw_history_lags = (5, 10, 20, 30, 40)
+    turbine_rated_power_w = 10e6
 
     def __init__(self, episode_length=200, dt=4.0, wind_speed=8.0,
                  wind_direction=270.0):
@@ -57,13 +63,22 @@ class WindFarmEnv:
         self.episode_length = int(episode_length)
         self.dt, self.wind_speed = float(dt), float(wind_speed)
         self.wind_direction = float(wind_direction) % 360
+        # FLORIS supplies this same table for the iea_10MW turbine used in the
+        # case. Reading it does not invoke or advance the wake simulator.
+        turbine_type = yaml.safe_load(DEFAULT_CASE.read_text())["wind_farm"]["farm"]["turbine_type"][0]
+        curve_path = resources.files("floris").joinpath("turbine_library", f"{turbine_type}.yaml")
+        table = yaml.safe_load(curve_path.read_text())["power_thrust_table"]
+        self._aligned_curve_speeds = np.asarray(table["wind_speed"], dtype=float)
+        self._aligned_curve_power_w = np.asarray(table["power"], dtype=float) * 1000.0
         self.action_space = [spaces.Box(-6.0, 6.0, (1,), np.float32) for _ in range(2)]
         self.observation_space = [
             spaces.Box(np.array([0, 0, -180], np.float32),
                        np.array([np.inf, 360, 180], np.float32)) for _ in range(2)]
-        self.share_observation_space = [
-            spaces.Box(np.tile(self.observation_space[0].low, 2),
-                       np.tile(self.observation_space[0].high, 2)) for _ in range(2)]
+        # [scaled actor observations (6), remaining fraction (1), each current
+        # power / rated power (2), yaw history (5 samples x 2 turbines)].
+        central_size = 6 + 1 + 2 + 2 * len(self.critic_yaw_history_lags)
+        self.share_observation_space = [spaces.Box(-np.inf, np.inf, (central_size,),
+                                                    dtype=np.float32) for _ in range(2)]
         self._iterator = self._temporary = self.interface = None
         self._handlers = []
 
@@ -131,7 +146,10 @@ class WindFarmEnv:
                 sim.controller = self.controller
                 self._iterator = sim.iter_sim()
                 self._steps, self.energy_j = 0, 0.0
+                self.turbine_energy_j = np.zeros(2, dtype=float)
                 obs, self._power = self._measure()
+                self._previous_turbine_power = self._turbine_power.copy()
+                self._obs = obs.copy()
             return obs
         except BaseException:
             self._handlers = [h for h in logger.handlers if h not in previous_handlers]
@@ -144,7 +162,10 @@ class WindFarmEnv:
     def _measure(self):
         measurements, _, velocity = next(self._iterator)
         latest = measurements.tail(2)
-        power = float(latest["Power_FLORIS"].sum(skipna=False))
+        if "t_idx" in latest.columns:
+            latest = latest.sort_values("t_idx")
+        self._turbine_power = latest["Power_FLORIS"].to_numpy(dtype=float)
+        power = float(np.sum(self._turbine_power))
         speed = np.linalg.norm(velocity, axis=1)
         direction = (270 - np.rad2deg(np.arctan2(velocity[:, 1], velocity[:, 0]))) % 360
         headings = np.array([t.get_yaw_orientation()
@@ -154,9 +175,56 @@ class WindFarmEnv:
         # lateral flow, not a vector reconstructed from ambient direction.
         yaw = (direction - headings + 180) % 360 - 180
         obs = np.column_stack((speed, direction, yaw)).astype(np.float32)
-        if not np.isfinite(obs).all() or not np.isfinite(power):
+        if self._turbine_power.shape != (2,) or not np.isfinite(obs).all() or not np.isfinite(power):
             raise RuntimeError("OFF produced invalid local wind or FLORIS power.")
         return obs, power
+
+    def get_centralized_obs(self):
+        """Critic information at the current measurement, including time left.
+
+        Local features are scaled as speed/10 m/s, direction/360 degrees and
+        yaw/180 degrees to give the time feature a useful numerical scale.
+        The yaw history is a compact sample of OFF's wake-producing turbine
+        state chain, not a complete representation of the simulated wake. Values
+        are wrapped and scaled to [-1, 1]; lags past the available chain use
+        its oldest state. The actor observation remains local and unchanged.
+        """
+        if self._iterator is None:
+            raise RuntimeError("Call reset() before requesting critic observations.")
+        history = []
+        for turbine in self.interface.wind_farm.turbines:
+            yaw = np.asarray(turbine.turbine_states.get_all_yaw(), dtype=float)
+            if yaw.size == 0:
+                raise RuntimeError("OFF did not provide turbine yaw history.")
+            for lag in self.critic_yaw_history_lags:
+                angle = yaw[min(lag, len(yaw) - 1)]
+                history.append(((angle + 180.0) % 360.0 - 180.0) / 180.0)
+        scaled_obs = self._obs / np.array([10.0, 360.0, 180.0])
+        return np.concatenate((scaled_obs.reshape(-1),
+                               [1.0 - self._steps / self.episode_length],
+                               self._turbine_power / self.turbine_rated_power_w,
+                               history)).astype(np.float32)
+
+    def get_individual_baseline_values(self, gamma):
+        """Approximate each aligned turbine's remaining normalized return.
+
+        Evaluate the installed FLORIS turbine power curve at each turbine's
+        *current local* wind speed and multiply by the discounted number of
+        remaining steps. This uses no additional simulation. The current wake
+        could itself depend on prior actions, so this is a state-dependent
+        reference, not the exact outcome of an aligned farm counterfactual.
+        """
+        if self._iterator is None:
+            raise RuntimeError("Call reset() before requesting baseline values.")
+        if not np.isfinite(gamma) or not 0.0 <= gamma <= 1.0:
+            raise ValueError("gamma must be finite and between 0 and 1.")
+        remaining_steps = self.episode_length - self._steps
+        discount_sum = (float(remaining_steps) if gamma == 1.0 else
+                        float(-np.expm1(remaining_steps * np.log(gamma)) / (1.0 - gamma))
+                        if gamma > 0.0 else float(remaining_steps > 0))
+        aligned_power_w = np.interp(self._obs[:, 0], self._aligned_curve_speeds,
+                                    self._aligned_curve_power_w, left=0.0, right=0.0)
+        return (aligned_power_w / self.turbine_rated_power_w * discount_sum).astype(np.float32)
 
     def step(self, actions):
         if self._iterator is None or self._steps >= self.episode_length:
@@ -169,16 +237,25 @@ class WindFarmEnv:
         self.controller.rates = np.clip(rates[:, 0], -6, 6)
         with self._scope():
             obs, power = self._measure()
-        interval_energy = 0.5 * (self._power + power) * self.dt
+        turbine_interval_energy = 0.5 * (self._previous_turbine_power + self._turbine_power) * self.dt
+        interval_energy = float(turbine_interval_energy.sum())
         self._power = power
+        self._previous_turbine_power = self._turbine_power.copy()
+        self._obs = obs.copy()
         self.energy_j += interval_energy
+        self.turbine_energy_j += turbine_interval_energy
         self._steps += 1
-        # 20 MW is the total rated power of the two original 10 MW turbines.
-        reward = interval_energy / (20e6 * self.dt)
-        rewards = np.full((2, 1), reward, dtype=np.float32)
+        # Each actor receives its turbine's interval energy / (10 MW * dt).
+        # Team reward is farm energy / (20 MW * dt), the mean of the two.
+        rewards = (turbine_interval_energy / (self.turbine_rated_power_w * self.dt)).astype(np.float32).reshape(2, 1)
+        team_reward = interval_energy / (2 * self.turbine_rated_power_w * self.dt)
         done = self._steps == self.episode_length
         infos = [{"farm_power_w": power, "interval_energy_j": interval_energy,
                   "episode_energy_j": self.energy_j,
+                  "turbine_power_w": float(self._turbine_power[i]),
+                  "turbine_interval_energy_j": float(turbine_interval_energy[i]),
+                  "turbine_episode_energy_j": float(self.turbine_energy_j[i]),
+                  "team_reward": team_reward,
                   "yaw_rate_deg_s": float(self.controller.applied_rates[i])}
                  for i in range(2)]
         return obs, rewards, np.full(2, done, dtype=bool), infos

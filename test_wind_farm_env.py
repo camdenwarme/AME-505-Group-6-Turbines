@@ -13,6 +13,42 @@ from wind_farm_env import WindFarmEnv
 
 
 class WindFarmEnvTests(unittest.TestCase):
+    def test_configured_wind_changes_aligned_reference(self):
+        reference = []
+        for speed in (8.0, 10.0):
+            env = WindFarmEnv(episode_length=4, wind_speed=speed)
+            try:
+                env.reset()
+                reference.append(env.get_individual_baseline_values(1.0))
+            finally:
+                env.close()
+        self.assertGreater(reference[1][0], reference[0][0])
+        self.assertLess(reference[0][1], reference[0][0])  # downstream wake
+
+    def test_aligned_reference_uses_local_wind_and_remaining_horizon(self):
+        # No OFF simulation is started: values are read from FLORIS's turbine
+        # curve and the critic's current local measurements.
+        env = WindFarmEnv(episode_length=4, wind_speed=8.0)
+        env._iterator = object()
+        env._steps = 0
+        env._obs = np.array([[8.0, 270.0, 0.0], [6.0, 270.0, 0.0]], np.float32)
+        # FLORIS's IEA-10MW table reports 4.44026484 MW and 1.85502326 MW.
+        rates = np.array([4.44026484, 1.85502326]) / 10.0
+        np.testing.assert_allclose(env.get_individual_baseline_values(1.0), 4 * rates, rtol=1e-6)
+        np.testing.assert_allclose(env.get_individual_baseline_values(0.5),
+                                   (1 + 0.5 + 0.25 + 0.125) * rates, rtol=1e-6)
+        env._steps = 3
+        np.testing.assert_allclose(env.get_individual_baseline_values(1.0), rates, rtol=1e-6)
+        env._obs[:, 0] = [10.0, 8.0]  # changing wind changes each reference
+        changed = env.get_individual_baseline_values(1.0)
+        self.assertGreater(changed[0], rates[0])
+        self.assertGreater(changed[1], rates[1])
+        env._steps = 4
+        np.testing.assert_array_equal(env.get_individual_baseline_values(1.0), [0, 0])
+        with self.assertRaises(ValueError):
+            env.get_individual_baseline_values(1.1)
+        env._iterator = None
+
     def test_feedback_matches_prescribed_rollout(self):
         """Catch action timing errors by comparing to the existing batch wrapper."""
         env = WindFarmEnv(episode_length=3)
@@ -20,7 +56,11 @@ class WindFarmEnvTests(unittest.TestCase):
             obs = env.reset()
             self.assertEqual(obs.shape, (2, 3))
             np.testing.assert_allclose(obs[:, 2], obs[:, 1].astype(float) - 270, atol=3e-5)
-            self.assertEqual(env.share_observation_space[0].shape, (6,))
+            self.assertEqual(env.share_observation_space[0].shape, (19,))
+            initial_central = env.get_centralized_obs()
+            np.testing.assert_allclose(initial_central[:6], (obs / [10, 360, 180]).reshape(-1), atol=1e-7)
+            self.assertEqual(initial_central[6], 1.0)
+            self.assertTrue(env.share_observation_space[0].contains(initial_central))
             self.assertLess(obs[1, 0], obs[0, 0])  # downstream wake is observed
             case = Path(env._temporary.name) / "case.yaml"
             with tempfile.TemporaryDirectory() as work:
@@ -28,6 +68,8 @@ class WindFarmEnvTests(unittest.TestCase):
                                 np.full(4, 8.0), np.full(4, 270.0),
                                 case=case, dt=4, work_dir=work)
             rewards = []
+            team_rewards = []
+            batch_turbine_power = batch["measurements"].pivot(index="time", columns="t_idx", values="Power_FLORIS").sort_index().to_numpy()
             for step in range(3):
                 obs, reward, done, info = env.step([[1.0], [-1.0]])
                 self.assertEqual(obs.shape, (2, 3))
@@ -37,12 +79,19 @@ class WindFarmEnvTests(unittest.TestCase):
                 for i in range(2):
                     self.assertTrue(env.observation_space[i].contains(obs[i]))
                 self.assertEqual(reward.shape, (2, 1))
-                self.assertEqual(reward[0, 0], reward[1, 0])
+                expected_turbine_energy = 0.5 * (batch_turbine_power[step] + batch_turbine_power[step + 1]) * env.dt
+                np.testing.assert_allclose(reward[:, 0], expected_turbine_energy / (10e6 * env.dt), rtol=1e-6)
+                self.assertAlmostEqual(info[0]["team_reward"], float(reward.mean()), places=7)
+                np.testing.assert_allclose([item["turbine_interval_energy_j"] for item in info], expected_turbine_energy, rtol=1e-10)
+                self.assertAlmostEqual(env.get_centralized_obs()[6], 1 - (step + 1) / 3, places=6)
                 self.assertTrue(np.all(done == (step == 2)))
                 self.assertAlmostEqual(info[0]["farm_power_w"], batch["farm_power"][step + 1], delta=1e-5)
-                rewards.append(float(reward[0, 0]))
+                rewards.append(reward[:, 0].copy())
+                team_rewards.append(info[0]["team_reward"])
             self.assertAlmostEqual(env.energy_j, batch["energy"], delta=1e-3)
-            self.assertAlmostEqual(sum(rewards) * 20e6 * env.dt, env.energy_j, delta=20)
+            self.assertAlmostEqual(sum(team_rewards) * 20e6 * env.dt, env.energy_j, delta=1e-3)
+            np.testing.assert_allclose(np.sum(rewards, axis=0) * 10e6 * env.dt, env.turbine_energy_j, rtol=1e-6)
+            self.assertAlmostEqual(sum(item["turbine_episode_energy_j"] for item in info), env.energy_j, delta=1e-3)
             with self.assertRaises(RuntimeError):
                 env.step([[0], [0]])
         finally:
@@ -134,6 +183,23 @@ class WindFarmEnvTests(unittest.TestCase):
         np.testing.assert_allclose(obs[0], [8, 270, 0])
         direction = 270 - np.degrees(np.arctan2(1, 4))
         np.testing.assert_allclose(obs[1], [np.sqrt(17), direction, direction - 270], atol=2e-5)
+
+    def test_critic_observation_includes_time_power_and_yaw_history(self):
+        env = WindFarmEnv(episode_length=10)
+        env._iterator = iter(())  # get_centralized_obs only checks an active episode
+        env._steps = 3
+        env._obs = np.array([[8, 270, 3], [6, 268, -2]], dtype=np.float32)
+        env._turbine_power = np.array([8e6, 4e6])
+        histories = [np.arange(41, dtype=float), np.full(3, 270.0)]
+        turbines = [SimpleNamespace(turbine_states=SimpleNamespace(get_all_yaw=lambda h=h: h))
+                    for h in histories]
+        env.interface = SimpleNamespace(wind_farm=SimpleNamespace(turbines=turbines))
+        central = env.get_centralized_obs()
+        np.testing.assert_allclose(central[:6], (env._obs / [10, 360, 180]).flatten(), atol=1e-7)
+        np.testing.assert_allclose(central[6:9], [0.7, 0.8, 0.4])
+        np.testing.assert_allclose(central[9:14], np.array([5, 10, 20, 30, 40]) / 180)
+        np.testing.assert_allclose(central[14:], np.full(5, -0.5))
+        self.assertTrue(env.share_observation_space[0].contains(central))
 
     def test_yawed_wake_changes_downstream_observed_direction_after_travel(self):
         env = WindFarmEnv(episode_length=42)
