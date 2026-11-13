@@ -21,12 +21,21 @@ the farm trajectory (once per PPO epoch/minibatch, rather than once per turbine)
 This behavior is implemented in `shared_critic_runner.py`; light_mappo is unchanged.
 Each actor receives exactly `[local wind speed in m/s, local wind direction in
 degrees, its own wind-relative yaw in degrees]`. Yaw is `wind direction - rotor
-heading`, wrapped to `[-180, 180)`, so aligned turbines observe zero yaw. Positive
-heading-rate commands decrease this yaw. The actor sees the actual yaw, including
+heading`, wrapped to `[-180, 180)`, so turbines aligned with local inflow observe
+zero yaw. For fixed local wind direction, positive heading-rate commands decrease
+this yaw. The actor sees the actual yaw, including
 backward-facing angles, rather than the substitute angle used by FLORIS. No power,
-position, turbine identity, or other turbine's information is included. OFF's wake model supplies
-an effective local speed and reconstructs its direction using the ambient state;
-this is not a resolved CFD measurement of local wake crossflow.
+position, turbine identity, or other turbine's information is included. The FLORIS
+adapter now returns rotor-area-averaged horizontal velocity components including
+modeled transverse flow. Components are averaged linearly on the rotor grid (with
+cubature weights when configured), kept in original turbine order, and rotated
+from the wind-aligned FLORIS frame into world coordinates. The observation speed
+is the magnitude of this mean horizontal vector; direction is its meteorological
+wind-from angle. Yaw is relative to that local direction, not ambient direction.
+This is modeled engineering-wake inflow, not blade-resolved CFD; vertical flow
+does not enter yaw. FLORIS's power calculation retains its own cubic-mean speed
+and aerodynamic yaw conventions. Wake-history propagation still uses ambient
+velocity. Retrain policies learned with the previous ambient-direction inputs.
 
 Each action is a yaw/heading rate in degrees per second, saturated to [-6, 6].
 Positive means increasing absolute heading. There is no yaw travel limit;
@@ -116,8 +125,8 @@ Regenerate it for a folder that already contains both plots using:
 `python training_report.py <run-folder>`.
 
 Before training (`episode0`), after every 10 completed training episodes, and after
-the final episode, a fresh episode runs using the actors' deterministic mean
-actions with no exploration or learning. Videos use the number of completed
+the final episode, an evaluation episode runs using the actors' greedy policy
+(the Gaussian mean action), with no exploration or learning. Videos use the number of completed
 training episodes: `wind_farm_episode0.mp4`, `wind_farm_episode10.mp4`, etc. The
 default 100-episode run produces 11 videos ending with `wind_farm_episode100.mp4`.
 For a final episode that is not a multiple of 10, that episode also gets a video;
@@ -125,6 +134,54 @@ for example, a 12-episode run produces videos for episodes 0, 10, and 12. The
 final evaluation is recorded once even when it coincides with the 10-episode
 interval. Evaluation uses a separate simulator, preserves training random-number
 states, and never enters training buffers or counts against `num_env_steps`.
+
+Each evaluation also saves one time-history figure per turbine:
+`turbine1_states_episodeN.png` and `turbine2_states_episodeN.png`, using the same
+episode number as the corresponding video. Each figure has three panels showing
+that actor's observed local wind speed (m/s), wind-from direction (degrees), and
+wind-relative yaw (degrees in [-180, 180)), against simulation time in seconds.
+The recorded observations come from the same evaluation as the MP4, including
+the initial state and final state, with an automatically fitted y-axis for each
+panel. These are the actual actor inputs, including backward-facing yaw angles,
+not the substitute angles used internally by the FLORIS wake model. Creating
+the figures requires no extra simulation or training episode.
+
+`evaluation_states.html` collects these state-history figures into one standalone
+page, grouped by evaluation episode in numerical order, with turbine 1 above
+turbine 2. An episode navigation bar jumps to each section. Original aspect ratios
+are preserved, and all PNGs are embedded for offline viewing. The report is
+updated after every evaluation, starting at episode 0. Regenerate it from existing
+plots with `python training_report.py <run-folder> --evaluation-states`.
+
+Each evaluation also saves `reward_history_episodeN.png`, showing the shared farm
+reward per control step against simulation time. Rewards are aligned to interval
+end times (first sample at `dt`, not an invented reward at time zero). Both agents
+receive the same reward, so it is plotted once. The corresponding raw times and
+rewards are saved in `evaluation_rewards_episodeN.npz` for reproducibility. The
+reward figure is embedded below the turbine states in that episode's HTML section.
+
+The section is named **Farm history** and also contains
+`farm_energy_history_episodeN.png`: cumulative farm energy generated during that
+evaluation versus simulation time, in MWh, starting from zero at time zero.
+This uses the simulator's energy integral recorded in the same rollout as the
+video; it is not a sum across evaluation episodes. Raw energy histories are saved
+as `evaluation_energy_episodeN.npz`. Existing reward-only evaluations can be
+backfilled with `python plot_evaluation_energy.py <run-folder>`, then rebuilding
+the evaluation HTML. This inverts the fixed `20e6 * dt` reward normalization and
+therefore retains the small rounding error of the recorded rewards; new
+evaluations record simulator energy directly.
+
+Training CSV rows also record `episode_return` (the sum of rewards within that
+episode) and `episode_end_reward` (reward from its final control step), counting
+the team reward once. When training finishes, `reward_by_episode.png` plots
+total episode reward against episode number, with an automatically fitted
+y-axis. Training and evaluation (greedy policy) are separate labeled series. This
+compares all recorded episodes within the current run, not a running sum across
+episodes or across different run folders. The summary is embedded in both
+`evaluation_states.html` and `training_plots.html`. Regenerate it from recorded
+reward data with `python plot_rewards.py <run-folder>` and rebuild the HTML with
+`training_report.py`. Historical files without recorded rewards are not fabricated.
+
 Each video shows a top view of
 the actual layout, rotor bars and front-facing orientation arrows, ambient/local
 wind arrows and speeds, headings, relative yaw angles, applied yaw rates, farm
@@ -137,6 +194,6 @@ full 0-20 MW range. Y-axis labels remain absolute MW values without an offset.
 Default playback is 10x simulation speed, one frame per control step:
 each frame lasts `dt / 10` seconds. With a 4 s step this is 0.4 s per frame
 (2.5 FPS). A 200-step episode produces about 80 seconds of video. Use
-`--video-fps` to explicitly override this rate. These are separate deterministic
-evaluation episodes, not recordings of the exploratory training episodes. Each
+`--video-fps` to explicitly override this rate. These are separate evaluation
+episodes using a greedy policy, not recordings of the exploratory training episodes. Each
 uses the same wind and time settings as training.

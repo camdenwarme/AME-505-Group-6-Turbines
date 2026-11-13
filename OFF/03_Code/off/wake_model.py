@@ -23,6 +23,7 @@ import off.utils as ot
 import logging
 from floris.flow_visualization import visualize_cut_plane
 from floris import FlorisModel, TimeSeries
+from floris.core.rotor_velocity import average_velocity
 import matplotlib.pyplot as plt
 import yaml
 import os
@@ -492,6 +493,24 @@ class Floris4Wake(WakeModel):
         )
         
 
+    def get_rotor_velocities_world(self):
+        """Horizontal mean inflow vectors after run(), in original turbine order.
+
+        FLORIS finalizes flow_field.u/v by undoing turbine sorting, but the
+        components remain in the wind-aligned frame. Average components linearly
+        (including signed lateral flow), then rotate vectors into world x/y.
+        This is a rotor-area mean, distinct from the cubic-mean speed used by
+        FLORIS's power model. Vertical velocity is excluded from yaw control.
+        """
+        flow = self.fmodel.core.flow_field
+        weights = self.fmodel.core.grid.cubature_weights
+        method = "simple-mean" if weights is None else "simple-cubature"
+        u = average_velocity(flow.u, method=method, cubature_weights=weights)
+        v = average_velocity(flow.v, method=method, cubature_weights=weights)
+        angle = np.deg2rad(270.0 - np.asarray(flow.wind_directions))[:, None]
+        cosine, sine = np.cos(angle), np.sin(angle)
+        return np.stack((cosine * u - sine * v, sine * u + cosine * v), axis=-1)
+
     def get_measurements_i_t(self, i_t: int) -> tuple:
         """
         Returns the measurements of the wake model including the effective wind speed at the turbine i_t
@@ -520,6 +539,7 @@ class Floris4Wake(WakeModel):
         TIs = self.fmodel.get_turbine_TIs()
         Pows = self.fmodel.get_turbine_powers()
         Pows[self._zero_power] = 0.0
+        rotor_velocity = self.get_rotor_velocities_world()[0, i_t]
 
         # Store measurements in a pandas dataframe
         measurements = pd.DataFrame(
@@ -533,6 +553,12 @@ class Floris4Wake(WakeModel):
             ]],
             columns=['t_idx', 'u_abs_eff_FLORIS', 'Ct_FLORIS', 'AI_FLORIS', 'TI_FLORIS','Power_FLORIS']
         )
+
+        # Preserve the scalar return for other OFF callers, while exposing the
+        # actual modeled local vector to TWFSolver instead of recreating it from
+        # the ambient direction.
+        measurements["u_world_FLORIS"] = rotor_velocity[0]
+        measurements["v_world_FLORIS"] = rotor_velocity[1]
 
         # Return the effective wind speed and the measurements
         return avg_vel.flatten()[i_t], measurements

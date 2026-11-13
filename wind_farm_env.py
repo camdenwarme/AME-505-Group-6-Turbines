@@ -149,8 +149,9 @@ class WindFarmEnv:
         direction = (270 - np.rad2deg(np.arctan2(velocity[:, 1], velocity[:, 0]))) % 360
         headings = np.array([t.get_yaw_orientation()
                              for t in self.interface.wind_farm.turbines])
-        # OFF convention: yaw = wind direction minus rotor heading. Expose the
-        # actual rotor orientation, never the surrogate angle sent to FLORIS.
+        # OFF convention: yaw = LOCAL wind-from direction minus rotor heading.
+        # FLORIS supplies a rotor-averaged world-coordinate vector, including
+        # lateral flow, not a vector reconstructed from ambient direction.
         yaw = (direction - headings + 180) % 360 - 180
         obs = np.column_stack((speed, direction, yaw)).astype(np.float32)
         if not np.isfinite(obs).all() or not np.isfinite(power):

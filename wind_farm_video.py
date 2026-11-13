@@ -1,6 +1,11 @@
-"""Render a deterministic rollout of the trained turbine actors to MP4."""
+"""Render an evaluation rollout using the actors' greedy policy to MP4."""
 
 from pathlib import Path
+
+from plot_evaluation_states import plot_evaluation_states
+from plot_evaluation_energy import plot_evaluation_energy
+from plot_rewards import plot_evaluation_rewards
+from training_report import write_evaluation_state_report
 
 import imageio.v2 as imageio
 from matplotlib.backends.backend_agg import FigureCanvasAgg
@@ -115,7 +120,7 @@ class WindFarmVideo:
         for spine in power.spines.values():
             spine.set_color("#35465b")
         fig.text(0.055, 0.025,
-                 f"Top view • deterministic evaluation • {env.dt * self.fps:g}× simulation speed • "
+                 f"Top view • evaluation (greedy policy, no exploration) • {env.dt * self.fps:g}× simulation speed • "
                  "wake field not drawn", color="#a5b4c8", fontsize=9)
         self.canvas.draw()
         return np.asarray(self.canvas.buffer_rgba())[:, :, :3].copy()
@@ -123,7 +128,7 @@ class WindFarmVideo:
 
 @torch.no_grad()
 def record_policy_video(env, policies, output_path, fps=None, episode=None):
-    """Use actor means, one frame per control step plus the initial state.
+    """Use actor means, recording video and per-turbine state-history plots.
 
     By default, each frame lasts dt / 10 seconds (10x simulated-time playback).
     Uses the raw environment so the last frame is the terminal state, rather
@@ -140,10 +145,13 @@ def record_policy_video(env, policies, output_path, fps=None, episode=None):
         for policy in policies:
             policy.actor.eval()
         obs = env.reset()
+        observations = [obs.copy()]
         states = [np.zeros((1, policy.actor._recurrent_N, policy.actor.hidden_size), np.float32)
                   for policy in policies]
         mask = np.ones((1, 1), np.float32)
         times, powers = [0.0], [env._power]
+        reward_history = []
+        energy_history = [0.0]
         renderer = WindFarmVideo(fps, episode)
         with imageio.get_writer(output_path, format="FFMPEG", fps=fps,
                                 codec="libx264", quality=8, macro_block_size=16) as writer:
@@ -153,13 +161,21 @@ def record_policy_video(env, policies, output_path, fps=None, episode=None):
                 for i, policy in enumerate(policies):
                     action, states[i] = policy.act(obs[i:i + 1], states[i], mask, deterministic=True)
                     actions.append(action.detach().cpu().numpy()[0])
-                obs, _, dones, infos = env.step(np.stack(actions))
+                obs, rewards, dones, infos = env.step(np.stack(actions))
+                reward_history.append(float(rewards[0, 0]))
+                energy_history.append(float(infos[0]["episode_energy_j"]))
+                observations.append(obs.copy())
                 times.append((step + 1) * env.dt)
                 powers.append(infos[0]["farm_power_w"])
                 rates = [item["yaw_rate_deg_s"] for item in infos]
                 writer.append_data(renderer.frame(env, obs, rates, times, powers))
                 if np.all(dones):
                     break
+        plot_evaluation_states(times, observations, output_path.parent, episode)
+        if episode is not None:
+            plot_evaluation_rewards(times[1:], reward_history, output_path.parent, episode)
+            plot_evaluation_energy(times, energy_history, output_path.parent, episode)
+            write_evaluation_state_report(output_path.parent)
         return output_path
     finally:
         for policy, training in zip(policies, training_modes):

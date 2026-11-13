@@ -68,7 +68,8 @@ class SharedCriticRunner(SeparatedRunner):
         self._csv_columns = ("episode", "environment_steps", "elapsed_seconds",
                              *(f"actor{i}_policy_loss" for i in range(self.num_agents)),
                              "critic_value_loss", "episode_energy_j", "episode_energy_mwh",
-                             "cumulative_energy_j", "cumulative_energy_mwh")
+                             "cumulative_energy_j", "cumulative_energy_mwh",
+                             "episode_return", "episode_end_reward")
         if not self.metrics_path.exists():
             with self.metrics_path.open("w", newline="", encoding="utf-8") as stream:
                 csv.DictWriter(stream, fieldnames=self._csv_columns).writeheader()
@@ -124,7 +125,10 @@ class SharedCriticRunner(SeparatedRunner):
                "episode_energy_j": self._episode_energy_j,
                "episode_energy_mwh": self._episode_energy_j / 3.6e9,
                "cumulative_energy_j": self._cumulative_energy_j,
-               "cumulative_energy_mwh": self._cumulative_energy_j / 3.6e9}
+               "cumulative_energy_mwh": self._cumulative_energy_j / 3.6e9,
+               # Shared team reward: count one turbine, not both copies.
+               "episode_return": float(self.buffer[0].rewards.sum(axis=0).mean()),
+               "episode_end_reward": float(self.buffer[0].rewards[-1].mean())}
         for i, info in enumerate(infos):
             row[f"actor{i}_policy_loss"] = float(info["policy_loss"])
         # Close after each row so progress is immediately readable, including

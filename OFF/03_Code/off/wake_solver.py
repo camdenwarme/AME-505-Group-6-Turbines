@@ -716,7 +716,14 @@ class TWFSolver(WakeSolver):
         # Get the measurements
         ueff, m = self.floris_wake.get_measurements_i_t(i_t_tmp)
         lg.info('Effective wind speed of turbine %s : %s m/s' % (i_t, ueff))
-        [u_eff, v_eff] = ot.ot_abs2uv(ueff, twf_a_states[i_t_tmp].get_turbine_wind_dir())
+        if "u_world_FLORIS" in m.columns:
+            # FLORIS 4 supplies rotor-averaged horizontal inflow, including
+            # transverse velocity, already rotated to world coordinates.
+            u_eff = float(m["u_world_FLORIS"].iloc[0])
+            v_eff = float(m["v_world_FLORIS"].iloc[0])
+        else:
+            # Preserve the existing interface for other wake-model backends.
+            [u_eff, v_eff] = ot.ot_abs2uv(ueff, twf_a_states[i_t_tmp].get_turbine_wind_dir())
         
         return np.array([u_eff, v_eff]), m
 

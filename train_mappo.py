@@ -82,7 +82,7 @@ def main():
             video = record_policy_video(evaluation_env, policies,
                                         run_dir / f"wind_farm_episode{episode}.mp4",
                                         args.video_fps, episode=episode)
-            print(f"Deterministic evaluation after {episode} training episodes: {video}", flush=True)
+            print(f"Evaluation (greedy policy, no exploration) after {episode} training episodes: {video}", flush=True)
         finally:
             evaluation_env.close()
 
@@ -96,8 +96,11 @@ def main():
         print(f"Training energy plot: {plot_training_energy(runner.metrics_path)}", flush=True)
         from plot_training_loss import plot_training_loss
         print(f"Training loss plot: {plot_training_loss(runner.metrics_path)}", flush=True)
-        from training_report import write_training_report
+        from plot_rewards import plot_reward_summary
+        print(f"Episode reward plot: {plot_reward_summary(run_dir)}", flush=True)
+        from training_report import write_training_report, write_evaluation_state_report
         print(f"Training plots report: {write_training_report(run_dir)}", flush=True)
+        print(f"Evaluation report: {write_evaluation_state_report(run_dir)}", flush=True)
     finally:
         envs.close()
         if runner is not None:

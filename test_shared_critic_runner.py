@@ -90,6 +90,8 @@ class SharedCriticTests(unittest.TestCase):
                             self.assertEqual(float(row["episode_energy_j"]), 4 * 3.6e6)
                             self.assertAlmostEqual(float(row["episode_energy_mwh"]), 0.004)
                             self.assertAlmostEqual(float(row["cumulative_energy_mwh"]), i * 0.004)
+                            self.assertEqual(float(row["episode_return"]), 2.0)
+                            self.assertEqual(float(row["episode_end_reward"]), 0.5)
                             for key in ("actor0_policy_loss", "actor1_policy_loss", "critic_value_loss"):
                                 self.assertTrue(np.isfinite(float(row[key])))
                         modules = [p.actor for p in runner.policy] + [runner.critic,
