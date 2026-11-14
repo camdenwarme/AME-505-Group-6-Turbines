@@ -6,6 +6,7 @@ from plot_evaluation_states import plot_evaluation_states
 from plot_evaluation_energy import plot_evaluation_energy
 from plot_rewards import plot_evaluation_rewards
 from training_report import write_evaluation_state_report
+from evaluate_wind_farm import evaluation_snapshot, write_evaluation_trajectory, scenario_metadata
 
 import imageio.v2 as imageio
 from matplotlib.backends.backend_agg import FigureCanvasAgg
@@ -16,7 +17,7 @@ import torch
 
 BACKGROUND = "#101b2b"
 FOREGROUND = "#e6edf5"
-COLORS = ("#69b9ff", "#ffc46b")
+COLORS = ("#69b9ff", "#ffc46b", "#dd95ff", "#ff8f98", "#96d885", "#78ded5")
 WIND = "#5ce0c5"
 
 
@@ -31,6 +32,7 @@ class WindFarmVideo:
         fig = self.figure
         fig.clear()
         turbines = env.interface.wind_farm.turbines
+        count = len(turbines)
         positions = np.array([t.base_location[:2] for t in turbines])
         headings = np.array([t.get_yaw_orientation() for t in turbines])
         title = "WIND FARM  /  POLICY EVALUATION"
@@ -43,6 +45,10 @@ class WindFarmVideo:
                  f"     Farm power {powers[-1] / 1e6:.2f} MW"
                  f"     Energy {env.energy_j / 3.6e9:.3f} MWh",
                  color=FOREGROUND, fontsize=12)
+        scenario_id = scenario_metadata(env)["scenario_id"]
+        if scenario_id:
+            fig.text(0.055, 0.865, f"Wind scenario: {scenario_id}",
+                     color="#a5b4c8", fontsize=8)
 
         farm = fig.add_axes([0.065, 0.40, 0.65, 0.44], facecolor=BACKGROUND)
         farm.set_xlim(positions[:, 0].min() - 300, positions[:, 0].max() + 300)
@@ -73,41 +79,45 @@ class WindFarmVideo:
             # arrow to distinguish front from back even after a half turn.
             farm.plot([position[0] - span[0], position[0] + span[0]],
                       [position[1] - span[1], position[1] + span[1]],
-                      color=COLORS[i], linewidth=6, solid_capstyle="round")
+                      color=COLORS[i % len(COLORS)], linewidth=6, solid_capstyle="round")
             farm.scatter(*position, s=70, color=FOREGROUND, zorder=5)
             farm.annotate("", xy=position + front * 135, xytext=position,
-                          arrowprops={"arrowstyle": "->", "color": COLORS[i], "lw": 2})
+                          arrowprops={"arrowstyle": "->", "color": COLORS[i % len(COLORS)], "lw": 2})
             local_angle = np.deg2rad(obs[i, 1])
             local_flow = -np.array([np.sin(local_angle), np.cos(local_angle)])
             start = position + np.array([0, -170])
             farm.annotate("", xy=start + local_flow * obs[i, 0] * 12, xytext=start,
                           arrowprops={"arrowstyle": "->", "color": WIND, "lw": 2})
             farm.text(position[0], position[1] - 240,
-                      f"Turbine {i + 1}  |  local wind {obs[i, 0]:.2f} m/s",
-                      color=COLORS[i], ha="center", fontsize=10)
+                      (f"Turbine {i + 1}\nlocal wind {obs[i, 0]:.2f} m/s" if count > 2 else
+                       f"Turbine {i + 1}  |  local wind {obs[i, 0]:.2f} m/s"),
+                      color=COLORS[i % len(COLORS)], ha="center", fontsize=8.5 if count > 2 else 10,
+                      va="center", linespacing=1.2)
 
         panel = fig.add_axes([0.765, 0.12, 0.22, 0.72])
         panel.axis("off")
-        for i in range(2):
-            y = 0.94 - i * 0.42
-            panel.text(0, y, f"TURBINE {i + 1}", color=COLORS[i], fontsize=14, weight="bold")
-            panel.text(0, y - 0.055,
+        compact = count > 2
+        for i in range(count):
+            y = 0.97 - i * (0.86 / count)
+            panel.text(0, y, f"TURBINE {i + 1}", color=COLORS[i % len(COLORS)],
+                       fontsize=12 if compact else 14, weight="bold")
+            panel.text(0, y - (0.035 if compact else 0.055),
                        f"Heading      {headings[i]:7.1f}°\n"
                        f"Relative yaw {obs[i, 2]:+7.1f}°\n"
                        f"Yaw rate     {rates[i]:+7.2f}°/s\n"
                        f"Local wind   {obs[i, 0]:7.2f} m/s\n"
                        f"Wind from    {obs[i, 1]:7.1f}°",
-                       color=FOREGROUND, fontsize=11, family="monospace",
-                       va="top", linespacing=1.8)
-        panel.text(0, 0.08, "Rotor bar + front-facing arrow\nGreen arrows: wind travel direction\n"
+                       color=FOREGROUND, fontsize=8.5 if compact else 11, family="monospace",
+                       va="top", linespacing=1.3 if compact else 1.8)
+        panel.text(0, 0.0 if compact else 0.08, "Rotor bar + front-facing arrow\nGreen arrows: wind travel direction\n"
                    "Headings: clockwise from north\nYaw = wind direction - heading",
-                   color="#a5b4c8", fontsize=9, linespacing=1.7)
+                   color="#a5b4c8", fontsize=7.5 if compact else 9, linespacing=1.3 if compact else 1.7)
 
         power = fig.add_axes([0.08, 0.11, 0.62, 0.21], facecolor=BACKGROUND)
         power_mw = np.asarray(powers) / 1e6
         power.plot(times, power_mw, color=WIND, linewidth=2)
         power.set_xlim(0, env.episode_length * env.dt)
-        # Zoom around the observed power history instead of the 20 MW rating.
+        # Zoom around the observed power history rather than the full farm rating.
         # Keep a small finite range for the initial frame or constant output.
         low, high = float(power_mw.min()), float(power_mw.max())
         padding = max((high - low) * 0.12, max(abs(low), abs(high)) * 0.001, 0.001)
@@ -127,7 +137,7 @@ class WindFarmVideo:
 
 
 @torch.no_grad()
-def record_policy_video(env, policies, output_path, fps=None, episode=None):
+def record_policy_video(env, policies, output_path, fps=None, episode=None, *, scenario=None):
     """Use actor means, recording video and per-turbine state-history plots.
 
     By default, each frame lasts dt / 10 seconds (10x simulated-time playback).
@@ -144,7 +154,9 @@ def record_policy_video(env, policies, output_path, fps=None, episode=None):
     try:
         for policy in policies:
             policy.actor.eval()
-        obs = env.reset()
+        if len(policies) != len(env.action_space):
+            raise ValueError("Expected one policy per turbine.")
+        obs = env.reset() if scenario is None else env.reset(scenario=scenario)
         observations = [obs.copy()]
         states = [np.zeros((1, policy.actor._recurrent_N, policy.actor.hidden_size), np.float32)
                   for policy in policies]
@@ -152,10 +164,11 @@ def record_policy_video(env, policies, output_path, fps=None, episode=None):
         times, powers = [0.0], [env._power]
         reward_history = []
         energy_history = [0.0]
+        snapshots = [evaluation_snapshot(env, obs, 0, np.zeros(len(policies)))]
         renderer = WindFarmVideo(fps, episode)
         with imageio.get_writer(output_path, format="FFMPEG", fps=fps,
                                 codec="libx264", quality=8, macro_block_size=16) as writer:
-            writer.append_data(renderer.frame(env, obs, np.zeros(2), times, powers))
+            writer.append_data(renderer.frame(env, obs, np.zeros(len(policies)), times, powers))
             for step in range(env.episode_length):
                 actions = []
                 for i, policy in enumerate(policies):
@@ -170,9 +183,11 @@ def record_policy_video(env, policies, output_path, fps=None, episode=None):
                 times.append((step + 1) * env.dt)
                 powers.append(infos[0]["farm_power_w"])
                 rates = [item["yaw_rate_deg_s"] for item in infos]
+                snapshots.append(evaluation_snapshot(env, obs, step + 1, rates, infos, np.stack(actions)))
                 writer.append_data(renderer.frame(env, obs, rates, times, powers))
                 if np.all(dones):
                     break
+        write_evaluation_trajectory(output_path.with_name(output_path.stem + "_steps.csv"), snapshots)
         plot_evaluation_states(times, observations, output_path.parent, episode)
         if episode is not None:
             plot_evaluation_rewards(times[1:], reward_history, output_path.parent, episode)

@@ -3,6 +3,7 @@
 import argparse
 import csv
 from pathlib import Path
+import re
 
 from matplotlib.backends.backend_agg import FigureCanvasAgg
 from matplotlib.figure import Figure
@@ -19,14 +20,18 @@ def plot_training_loss(metrics_path):
     if not rows:
         raise ValueError("No completed training episodes are available to plot.")
     episodes = np.array([int(row["episode"]) for row in rows])
-    figure = Figure(figsize=(10, 9), dpi=160, layout="constrained")
+    actor_columns = sorted((key for key in rows[0] if re.fullmatch(r"actor\d+_policy_loss", key)),
+                           key=lambda key: int(re.search(r"\d+", key)[0]))
+    if not actor_columns:
+        raise ValueError("No actor policy-loss columns are recorded.")
+    panels = [(key, f"Turbine {int(key.split('_')[0][5:]) + 1} actor", "PPO policy loss",
+               ("#1768ac", "#b76a12", "#8054a8", "#b34e4e")[i % 4])
+              for i, key in enumerate(actor_columns)]
+    panels.append(("critic_value_loss", "Shared centralized critic", "Value loss", "#16806a"))
+    figure = Figure(figsize=(10, 2.6 * len(panels)), dpi=160, layout="constrained")
     FigureCanvasAgg(figure)
-    axes = figure.subplots(3, 1, sharex=True)
-    for axis, (column, title, label, color) in zip(axes, (
-        ("actor0_policy_loss", "Turbine 1 actor", "PPO policy loss", "#1768ac"),
-        ("actor1_policy_loss", "Turbine 2 actor", "PPO policy loss", "#b76a12"),
-        ("critic_value_loss", "Shared centralized critic", "Value loss", "#16806a"),
-    )):
+    axes = figure.subplots(len(panels), 1, sharex=True)
+    for axis, (column, title, label, color) in zip(axes, panels):
         values = np.array([float(row[column]) for row in rows])
         if not np.isfinite(values).all():
             raise ValueError(f"Loss values in {column} must be finite.")

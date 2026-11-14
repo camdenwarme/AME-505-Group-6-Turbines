@@ -41,7 +41,7 @@ def evaluation_series(run_dir, field):
                     raise ValueError(f"Nonfinite {field} in {path}")
                 if row.get("policy") == "greedy":
                     greedy[int(row["episode"])] = value
-                elif row.get("policy") == "aligned_baseline":
+                elif row.get("policy") in ("aligned_baseline", "yaw_tracking_baseline"):
                     baseline = value
 
     pattern = ("evaluation_rewards_episode*.npz" if field == "team_return"
@@ -59,6 +59,15 @@ def evaluation_series(run_dir, field):
             value = float(values.sum() if field == "team_return" else values[-1] / 3.6e9)
         greedy[int(match[1])] = value
     return sorted(greedy.items()), baseline
+
+
+def evaluation_baseline_label(run_dir):
+    path = Path(run_dir) / "evaluation_metrics.csv"
+    if path.exists():
+        with path.open(newline="", encoding="utf-8") as stream:
+            if any(row.get("policy") == "yaw_tracking_baseline" for row in csv.DictReader(stream)):
+                return "Yaw-tracking baseline"
+    return "Aligned baseline"
 
 
 def plot_evaluation_rewards(times, rewards, output_dir, episode):
@@ -114,7 +123,7 @@ def plot_reward_summary(run_dir):
         all_values.extend(returns)
     if baseline is not None:
         axis.axhline(baseline, color="#536276", linestyle="--", linewidth=1.2,
-                     label="Aligned baseline")
+                     label=evaluation_baseline_label(run_dir))
         all_values.append(baseline)
     _style(axis, all_values)
     axis.set_title("Total reward earned within each episode", loc="left", fontsize=12, weight="bold")

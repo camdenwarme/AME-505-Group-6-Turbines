@@ -5,10 +5,12 @@ import csv
 import json
 import math
 from pathlib import Path
+import re
 
 from matplotlib.backends.backend_agg import FigureCanvasAgg
 from matplotlib.figure import Figure
 from matplotlib.ticker import MaxNLocator
+from plot_rewards import evaluation_baseline_label
 
 
 def _rows(path):
@@ -53,10 +55,10 @@ def _stats(series):
             "mean": sum(values) / len(values), "min": min(values), "max": max(values)}
 
 
-def _yaw_series(rows):
+def _yaw_series(rows, agent_ids):
     """Return per-episode and pooled fractions of finite yaw samples >= 90°."""
     result = []
-    for turbine in range(2):
+    for turbine in agent_ids:
         counts = {}
         for row in rows:
             episode = _episode(row.get("episode"))
@@ -81,17 +83,25 @@ def make_diagnostics(run_dir, output_dir=None):
     training = _rows(run_dir / "training_metrics.csv")
     evaluation = _rows(run_dir / "evaluation_metrics.csv")
     rollout = _rows(run_dir / "rollout_steps.csv")
-
-    rmse = [("Farm critic", "#1768ac", _series(training, "critic_return_rmse")),
-            ("Turbine 1 critic", "#b76a12", _series(training, "actor0_individual_value_rmse")),
-            ("Turbine 2 critic", "#16806a", _series(training, "actor1_individual_value_rmse"))]
-    clips = [("Turbine 1 actor", "#b76a12", _series(training, "actor0_ppo_clip_fraction")),
-             ("Turbine 2 actor", "#16806a", _series(training, "actor1_ppo_clip_fraction"))]
-    yaw = _yaw_series(rollout)
-    yaw_lines = [("Turbine 1", "#b76a12", yaw[0][0]),
-                 ("Turbine 2", "#16806a", yaw[1][0])]
+    config_path = run_dir / "config.json"
+    config = json.loads(config_path.read_text()) if config_path.exists() else {}
+    found = {int(match[1]) for row in training[:1] + rollout[:1] for key in row
+             if (match := re.match(r"actor(\d+)_", key))}
+    agent_ids = list(range(int(config["num_agents"]))) if "num_agents" in config else sorted(found)
+    if not agent_ids:  # Preserve empty legacy-report behavior without assuming new runs are two-agent.
+        agent_ids = [0, 1]
+    colors = ("#b76a12", "#16806a", "#8054a8", "#b34e4e", "#527491", "#778b42")
+    rmse = [("Farm critic", "#1768ac", _series(training, "critic_return_rmse"))]
+    rmse.extend((f"Turbine {i + 1} critic", colors[j % len(colors)],
+                 _series(training, f"actor{i}_individual_value_rmse")) for j, i in enumerate(agent_ids))
+    clips = [(f"Turbine {i + 1} actor", colors[j % len(colors)],
+              _series(training, f"actor{i}_ppo_clip_fraction")) for j, i in enumerate(agent_ids)]
+    yaw = _yaw_series(rollout, agent_ids)
+    yaw_lines = [(f"Turbine {i + 1}", colors[j % len(colors)], yaw[j][0])
+                 for j, i in enumerate(agent_ids)]
     greedy = _series(evaluation, "farm_energy_mwh", policy="greedy")
-    baseline_points = _series(evaluation, "farm_energy_mwh", policy="aligned_baseline")
+    baseline_points = (_series(evaluation, "farm_energy_mwh", policy="aligned_baseline") or
+                       _series(evaluation, "farm_energy_mwh", policy="yaw_tracking_baseline"))
     baseline = baseline_points[-1][1] if baseline_points else None
 
     fig = Figure(figsize=(12, 8.4), dpi=140, layout="constrained")
@@ -110,7 +120,7 @@ def make_diagnostics(run_dir, output_dir=None):
                 drawn = True
         if baseline is not None:
             axis.axhline(baseline, color="#536276", linestyle="--", linewidth=1.2,
-                         label="Aligned baseline")
+                         label=evaluation_baseline_label(run_dir))
             drawn = True
         axis.set_title(title, loc="left", weight="bold", fontsize=11)
         axis.set_ylabel(ylabel)
@@ -141,6 +151,7 @@ def make_diagnostics(run_dir, output_dir=None):
     summary = {"source_run": str(run_dir.resolve()),
                "training_metric_rows": len(training), "evaluation_rows": len(evaluation),
                "rollout_rows": len(rollout),
+               "agent_ids": agent_ids,
                "team_value_rmse": _stats(rmse[0][2]),
                "individual_value_rmse": [_stats(item[2]) for item in rmse[1:]],
                "ppo_clip_fraction": [_stats(item[2]) for item in clips],

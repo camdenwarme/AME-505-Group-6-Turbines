@@ -1,4 +1,8 @@
-# Two-turbine MAPPO
+# Wind-farm MAPPO: four-turbine square and seeded wind
+
+See [README_FOUR_TURBINES_DYNAMIC_WIND.md](README_FOUR_TURBINES_DYNAMIC_WIND.md)
+for the structured change record, implementation locations, design decisions,
+verification, and information-preservation details for this update.
 
 Uses the sibling `../light_mappo` checkout directly; no submodule or copied MAPPO
 code is needed. Pass `--mappo-path C:/path/to/light_mappo` for another location.
@@ -9,10 +13,53 @@ python -m venv .venv
 .venv/Scripts/python.exe train_mappo.py
 ```
 
-The environment derives a two-turbine case from the existing FLORIS case without
-changing the original example. The turbines are at (0, 0) and (5D, 0), with D=198 m.
-Ambient wind is constant: 8 m/s from 270 degrees by default. Change it with
-`--wind-speed` and `--wind-direction` (meteorological degrees, **from** direction).
+The environment derives a configurable farm from the existing FLORIS case without
+changing the original example. The default is four IEA-10MW turbines in a square,
+ordered `(0,0)`, `(0,5D)`, `(5D,0)`, `(5D,5D)`, with D=198 m and 990 m between
+adjacent turbines. Agent indices 0/1 are the first column, and 2/3 the second.
+`--layout-file <json-file>` accepts a JSON array of `[x,y]` or `[x,y,z]` positions
+in rotor diameters. Agent count, farm bounds, array sizes, centralized features,
+and rated power derive from the layout; all turbines currently use the case's
+same 10MW type. With N turbines the normalized farm rating is N*10MW.
+
+Wind is fixed at 8 m/s from 270 degrees by default. `--wind-speed` and
+`--wind-direction` set these base conditions (meteorological **from** degrees).
+The `--wind-mode` switch enables seeded time-varying wind inside every episode:
+
+| Option | Behavior |
+| --- | --- |
+| `--wind-mode off` | Fixed base speed and direction; default. |
+| `--wind-mode speed` | Random speed knots; fixed base direction. |
+| `--wind-mode direction` | Fixed base speed; random direction knots. |
+| `--wind-mode both` | Random speed and direction knots. |
+| `--wind-seed` | Training-wind seed; defaults to `--seed`. |
+| `--eval-wind-seed` | Evaluation-wind seed; defaults to `--seed`, using a separate stream. |
+| `--wind-speed-min`, `--wind-speed-max` | Random speed knot bounds; defaults 6 and 10 m/s. |
+| `--wind-direction-half-width` | Direction knot range around the base direction; default +/-15 degrees. |
+| `--wind-knot-interval` | Seconds between random knots; default 120. |
+
+```powershell
+# Four turbines with fixed wind and numeric evaluations
+.venv/Scripts/python.exe train_mappo.py --wind-mode off --no-video
+
+# Four turbines with reproducible dynamic speed and direction
+.venv/Scripts/python.exe train_mappo.py --wind-mode both --wind-seed 123 --eval-wind-seed 456 --wind-speed-min 6 --wind-speed-max 10 --wind-direction 270 --wind-direction-half-width 15 --wind-knot-interval 120 --no-video
+```
+
+`wind_profiles.py` samples knots using explicit master seed, stream, environment,
+and episode IDs, then interpolates between them. It uses independent speed and
+direction RNG substreams; toggling one quantity preserves the other's sampled
+realization. Directions are unwrapped along the shortest angular path before
+interpolation, so 359 to 1 degrees crosses north. The final partial interval
+preserves the nominal transition timescale. Direction bounds constrain sampled
+knots; shortest paths can leave a direction sector wider than 180 degrees.
+No global NumPy randomness is consumed by profile generation.
+
+Dynamic wind is applied to the new ambient-history head at the next measurement
+tick, while existing wake history is retained. Heading commands remain absolute
+rates, so zero command holds the rotor heading when the wind changes. Each
+episode starts aligned with that profile's initial ambient direction; wind and
+yaw histories are initialized consistently at that starting condition.
 
 Each turbine has its own actor and individual value critic; one additional shared
 centralized critic estimates future farm reward. Each rollout trains each actor
@@ -54,8 +101,9 @@ of reverse-flow operation. The controller records the applied rate in `info`.
 
 Every 4-second control interval (`--dt`), actor `i` gets its own turbine's
 trapezoidal interval energy divided by `10e6 * dt`. The team reward is farm
-interval energy divided by `20e6 * dt` (the average of the two individual
-rewards); it trains the shared critic and contributes to both actor updates.
+interval energy divided by `total_rated_power_w * dt` (`40e6 * dt` for the
+default square). It is the mean of the individual rewards for these identical
+turbines, trains the shared critic, and contributes to every actor update.
 There is no terminal energy bonus. `info` contains both individual and farm
 power and energy, as well as `team_reward`. Episodes are finite-horizon tasks,
 default 200 steps/800 s, starting with aligned turbines. `gamma=1` makes both
@@ -67,9 +115,9 @@ learned per-step residual from that turbine's individual critic. The analytic
 reference reads the installed FLORIS turbine
 power curve and evaluates it at that turbine's current local wind speed. It
 divides the interpolated aligned power by 10 MW and multiplies by the discounted
-number of steps remaining. The curve is the same for both turbines, but their
+number of steps remaining. The curve is the same for all turbines, but their
 reference values can differ because their local wind speeds differ in a wake.
-`--wind-speed` changes the configured ambient wind and therefore the local speeds
+`--wind-speed` and the dynamic wind profile change ambient wind and the local speeds
 seen in a run. The curve is read directly; computing this reference does not run
 an additional simulation. It assumes the current local speed persists, and the
 current wake can depend on earlier actions, so it is an approximation, not the
@@ -115,17 +163,20 @@ proven optimum. Override it with `--lr`, `--critic_lr`, and `--ppo_epoch`.
 ```
 
 Yaw now lets an actor distinguish aligned and misaligned rotor orientations.
-The full wake history remains hidden, so observations are still partial. Two
-separate actors let the turbines learn distinct roles without adding identity to
+The full wake history remains hidden, so observations are still partial. Independent
+actors let the turbines learn distinct roles without adding identity to
 their observations. Input LayerNorm remains disabled to preserve the independent
 speed and angle measurements; hidden layers still use LayerNorm. The centralized
-critic receives 19 inputs: both actor observations with speed/10, direction/360,
-and yaw/180, the fraction
-of the episode remaining, both current turbine powers divided by rated power, and
+critic receives `9*N+1` inputs: every actor observation with speed/10,
+direction/360, and yaw/180, the fraction
+of the episode remaining, every current turbine power divided by rated power, and
 five historical yaw samples for each turbine at lags 5, 10, 20, 30 and 40
 steps. History angles are wrapped and scaled to [-1, 1]; when a lag exceeds the
 available OFF state chain, the oldest available state is used. These samples are
-useful wake context, not the full simulator state. The critic estimates expected
+useful wake context, not the full simulator state. The default N=4 gives 37
+inputs, with the remaining-time feature at index 12. `WindFarmEnv` exposes
+`remaining_time_index=3*N`, and the runner passes that index to the horizon
+wrapper rather than assuming the former two-turbine index 6. The critic estimates expected
 remaining team reward under the current policy and its training targets; it is
 not an oracle for the optimal achievable future energy. Its network predicts
 average team reward per discounted remaining step; `HorizonScaledCritic`
@@ -137,13 +188,17 @@ disabled and rejected for this integration.
 
 Start a new training run after this change. Older checkpoints have incompatible
 critic inputs, action distributions, or individual-value architecture and are
-rejected. Current checkpoints use format 5 in `checkpoint_metadata.json`.
+rejected. Current checkpoints use format 6 in `checkpoint_metadata.json`, checking
+agent count, layout, rating, observation shape, and remaining-time index.
 
 Implementation hooks:
 
 - `WindFarmEnv._measure`, `get_centralized_obs`, `get_individual_baseline_values`,
   and `step` in `wind_farm_env.py` retrieve observations, build the critic input,
   evaluate the analytic aligned reference, and compute energy rewards.
+- `WindProfileConfig`, `WindScenario`, and `make_wind_scenario` in
+  `wind_profiles.py` define configuration, seeded generation, serialization,
+  interpolation, and explicit replay without a new random draw.
 - `TanhBoundedActionHead` in `bounded_action_head.py` transforms Gaussian actions
   and calculates their corrected PPO log probabilities.
 - `HorizonScaledCritic` in `horizon_critic.py` maps the farm network's per-step
@@ -158,15 +213,28 @@ Artifacts go to `rl_runs/mappo/<experiment>/<timestamp>/`, including configurati
 and `runtime_versions.json` with the Python and key package versions,
 one continuously updated `training_metrics.csv`,
 optional `wind_farm_episodeN.mp4` evaluation videos, `evaluation_metrics.csv`,
-TensorBoard logs, two actor checkpoints (`actor_agent0.pt`, `actor_agent1.pt`),
-two individual critic checkpoints (`individual_critic_agent0.pt`,
-`individual_critic_agent1.pt`), and one farm `critic.pt`.
+TensorBoard logs, N actor checkpoints (`actor_agent{i}.pt`), N individual critic
+checkpoints (`individual_critic_agent{i}.pt`), and one farm `critic.pt`.
+The default square creates four actors and four individual value critics.
 `--model_dir <models-folder>` loads the current checkpoint format
 for further training; optimizer state is not restored. The minimal launcher uses
 one training environment plus a separate evaluation environment; process isolation
 is required for future concurrent OFF workers.
 Evaluate learned policies against aligned operation with identical initial states
 and episode durations before claiming an energy improvement.
+
+`wind_scenarios.jsonl` records training-profile `reset` and `completed` events.
+Each event stores the full knot times, speeds, unwrapped directions, interpolation
+description, master and episode seeds, stream/environment/episode IDs, and stable
+scenario ID. `DummyVecEnv` automatically resets an ended episode before returning,
+so a final reset event can describe the next, unused episode; completed events
+identify profiles that actually supplied a full training rollout. Training metrics
+and `rollout_steps.csv` retain the completed transition's scenario metadata from
+`info`, rather than accidentally reporting the next reset's wind.
+`config.json` preserves both wind configurations, layout, count, time index, and
+farm rating; `runtime_versions.json` preserves key software versions. Exact resumed
+training is not promised by the saved network weights alone: optimizer and all
+RNG/counter states are not restored by the current checkpoint workflow.
 
 `training_metrics.csv` is created at run initialization and gets one row after
 every training episode's network update, before any scheduled evaluation.
@@ -187,7 +255,7 @@ it is not the raw squared error in total-return units. Losses are averages over 
 epochs/minibatches; actor policy losses exclude the entropy bonus. There is no
 single combined actor/critic loss because these are optimized separately.
 Energy comes from the simulator's per-episode integral, counted once for the farm,
-not twice for the two agents. Evaluation episodes are excluded from this training
+rather than once per agent. Evaluation episodes are excluded from this training
 CSV and from cumulative training energy. Elapsed wall time includes evaluations.
 
 At the end of a successful run, `cumulative_energy_by_episode.png` is saved next
@@ -201,8 +269,8 @@ Regenerate the plot for an existing CSV using:
 `python plot_training_energy.py <run-folder>`.
 
 The run also saves `training_loss_by_episode.png`, with separate panels for
-turbine 1's actor policy loss, turbine 2's actor policy loss, and the shared
-critic's value loss. Each panel has an independently fitted y-axis with 12%
+each turbine's actor policy loss and the shared critic's value loss. Each panel
+has an independently fitted y-axis with 12%
 padding so losses on different scales remain readable. Points are episode-level
 averages over PPO epochs/minibatches, as recorded in the CSV. Actor losses may be
 negative and exclude the entropy bonus. Regenerate this plot using:
@@ -219,11 +287,28 @@ Before training (`episode0`), every `--numeric-eval-interval` completed training
 episodes (default 10), and after the final episode, an evaluation episode runs
 using the actors' greedy policy (the `tanh`-transformed Gaussian mean), with no
 exploration or learning. `evaluation_metrics.csv` records farm and per-turbine
-energy and returns. With `--evaluate-aligned-baseline`, a separate zero-yaw-rate
-simulation is also evaluated at episode 0 under the same initial conditions. It
-is an optional physical benchmark, not the analytic reference used by GAE or an
-optimized wind-farm controller. Pass `--no-video` to retain numeric evaluations
-without generating video or video-based state/reward plots.
+energy and returns with the agent count, farm rating, and wind-scenario identifiers.
+The evaluation profile is generated once using the evaluation seed and stream 1,
+saved in `evaluation_wind_scenario.json`, and replayed unchanged at every
+checkpoint. Numeric evaluations, the optional baseline, and videos explicitly
+reset to this same scenario; they do not sample unrelated winds on each reset.
+Pass `--no-video` to retain numeric evaluations and per-tick CSVs without
+generating video or video-based state/reward plots.
+
+With `--evaluate-aligned-baseline`, an extra physical benchmark is evaluated at
+episode 0 on the same profile. Fixed-wind mode uses initially aligned headings
+and zero yaw-rate commands, labeled `aligned_baseline`. Dynamic modes use a
+local-wind yaw-tracking controller with the same actuator bounds, labeled
+`yaw_tracking_baseline`. This is an operational controller, not a perfect
+foreknowledge benchmark or the analytic reference used by GAE. A fixed-wind
+baseline measured in an earlier run is not a valid matched benchmark for an
+arbitrary dynamic profile.
+
+`evaluation_episodeN_steps.csv` records all evaluation ticks, including the
+initial state: actual turbine positions/headings, actor observations, commanded
+and applied rates, turbine/farm power, energy, and ambient wind. The video saves
+`wind_farm_episodeN_steps.csv` from its own rendered rollout, so frame k can be
+checked directly against tick k. Both contain scenario ID and seed metadata.
 
 Videos use the number of completed training episodes:
 `wind_farm_episode0.mp4`, `wind_farm_episode10.mp4`, etc. The default
@@ -236,7 +321,7 @@ preserves training random-number states, and never enters training buffers or
 counts against `num_env_steps`.
 
 Each rendered evaluation also saves one time-history figure per turbine:
-`turbine1_states_episodeN.png` and `turbine2_states_episodeN.png`, using the same
+`turbine1_states_episodeN.png` through `turbine{N_agents}_states_episodeN.png`, using the same
 episode number as the corresponding video. Each figure has three panels showing
 that actor's observed local wind speed (m/s), wind-from direction (degrees), and
 wind-relative yaw (degrees in [-180, 180)), against simulation time in seconds.
@@ -247,8 +332,8 @@ not the substitute angles used internally by the FLORIS wake model. Creating
 the figures requires no extra simulation or training episode.
 
 `evaluation_states.html` collects these state-history figures into one standalone
-page, grouped by evaluation episode in numerical order, with turbine 1 above
-turbine 2. An episode navigation bar jumps to each section. Original aspect ratios
+page, grouped by evaluation episode in numerical order and turbine index order.
+An episode navigation bar jumps to each section. Original aspect ratios
 are preserved, and all PNGs are embedded for offline viewing. The report is
 updated after every rendered evaluation, starting at episode 0. Regenerate it from existing
 plots with `python training_report.py <run-folder> --evaluation-states`.
@@ -268,9 +353,11 @@ This uses the simulator's energy integral recorded in the same rollout as the
 video; it is not a sum across evaluation episodes. Raw energy histories are saved
 as `evaluation_energy_episodeN.npz`. Existing reward-only evaluations can be
 backfilled with `python plot_evaluation_energy.py <run-folder>`, then rebuilding
-the evaluation HTML. This inverts the fixed `20e6 * dt` reward normalization and
-therefore retains the small rounding error of the recorded rewards; new
-evaluations record simulator energy directly.
+the evaluation HTML. This inverts the farm rating recorded in the run configuration
+(`40e6 * dt` for the default square, historical `20e6 * dt` for two turbines) and
+therefore retains the small rounding error of the recorded rewards. If a legacy
+run records neither farm rating nor agent count, the reconstruction fails rather
+than assuming two turbines. New evaluations record simulator energy directly.
 
 Training CSV rows record `episode_return` (the sum of team rewards within that
 episode), `episode_end_reward` (its final team reward), and each actor's
@@ -294,17 +381,21 @@ rotors are shown at their real angles. The initial and final episode states are
 included.
 The power subplot automatically zooms to the power values observed so far, with
 12% padding and a small minimum range for constant output, instead of using the
-full 0-20 MW range. Y-axis labels remain absolute MW values without an offset.
+full farm rated-power range. Y-axis labels remain absolute MW values without an offset.
 Default playback is 10x simulation speed, one frame per control step:
 each frame lasts `dt / 10` seconds. With a 4 s step this is 0.4 s per frame
 (2.5 FPS). A 200-step episode produces about 80 seconds of video. Use
 `--video-fps` to explicitly override this rate. These are separate evaluation
 episodes using a greedy policy, not recordings of the exploratory training episodes. Each
-uses the same wind and time settings as training.
+uses the same duration and configured wind distribution as training, with the
+explicit held-out evaluation profile rather than an exploratory training profile.
 
 `rollout_steps.csv` records every exploratory training transition, one row per
 zero-based tick and environment, after each completed rollout. `episode` is
 one-based. `time_start_s` and `time_end_s` bound the control interval. Each
+row includes `scenario_id`, `episode_seed`, `wind_mode`, and measured endpoint
+`ambient_wind_speed_m_s` and `ambient_wind_direction_deg`. These are distinct from
+the agents' local inflow observations. Each
 actor's `wind_speed_m_s`, `wind_direction_deg`, `yaw_deg`, and
 `sampled_rate_deg_s` are the observation and bounded Gaussian sample at the
 start of that interval; `applied_rate_deg_s`, `power_w`, and `farm_power_w`
@@ -324,8 +415,8 @@ Per actor, `aligned_reference_value` is the analytic power-curve reference,
 is the pre-standardization individual GAE computed with that value and the
 turbine's own rewards. These are rollout-time quantities, before critic updates.
 
-`training_metrics.csv` additionally contains `actor0_ppo_clip_fraction` and
-`actor1_ppo_clip_fraction`: the fraction of sampled importance ratios outside
+`training_metrics.csv` additionally contains `actor{i}_ppo_clip_fraction` for
+every actor: the fraction of sampled importance ratios outside
 the configured PPO clipping interval, averaged across each actor's optimizer
 minibatches and epochs. The fraction does not itself say whether clipping was
 active in the minimum surrogate for every one of those samples.
@@ -360,6 +451,7 @@ match aside from weight, seed and experiment label; for multiple seeds, each
 candidate must use the same seed set. It selects the highest mean final greedy
 farm energy, records per-turbine outcomes and sample sizes, and breaks exact
 ties toward the lowest weight. An aligned-baseline evaluation is not required
-for selection. Short pilots screen the tested weights only: they do not establish
+for selection. Initial/final evaluations and candidate weights must use the same
+wind scenario for each matched seed. Short pilots screen the tested weights only: they do not establish
 a global optimum, and choosing and assessing a weight on the same pilots is
 optimistic. Confirm any selected weight using new seeds and wind conditions.

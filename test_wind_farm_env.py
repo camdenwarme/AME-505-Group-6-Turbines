@@ -10,13 +10,93 @@ import numpy as np
 
 from fdynsim import FDynSim, REPO
 from wind_farm_env import WindFarmEnv
+from wind_profiles import WindProfileConfig, WindScenario
+
+
+def two_env(*args, **kwargs):
+    return WindFarmEnv(*args, layout=((0, 0), (5, 0)), **kwargs)
 
 
 class WindFarmEnvTests(unittest.TestCase):
+    def test_four_turbine_square_shapes_energy_and_metadata(self):
+        env = WindFarmEnv(episode_length=2)
+        try:
+            obs = env.reset()
+            self.assertEqual(env.num_agents, 4)
+            self.assertEqual(env.remaining_time_index, 12)
+            self.assertEqual(env.share_observation_space[0].shape, (37,))
+            self.assertEqual(obs.shape, (4, 3))
+            positions = np.array([t.base_location[:2] for t in env.interface.wind_farm.turbines])
+            np.testing.assert_allclose(positions, [[0, 0], [0, 990], [990, 0], [990, 990]])
+            initial_power = env._turbine_power.copy()
+            obs, rewards, dones, infos = env.step(np.zeros((4, 1)))
+            expected = .5 * (initial_power + env._turbine_power) * env.dt
+            self.assertEqual(rewards.shape, (4, 1))
+            self.assertEqual(dones.shape, (4,))
+            self.assertFalse(dones.any())
+            np.testing.assert_allclose(rewards[:, 0], expected / (10e6 * env.dt), rtol=1e-6)
+            self.assertAlmostEqual(infos[0]["team_reward"], expected.sum() / (40e6 * env.dt))
+            self.assertAlmostEqual(infos[0]["team_reward"], float(rewards.mean()), places=7)
+            self.assertEqual(len(infos), 4)
+            self.assertEqual(infos[0]["scenario_id"], env.wind_scenario.scenario_id)
+            self.assertNotIn("wind_scenario", infos[0])
+            _, _, dones, infos = env.step(np.zeros((4, 1)))
+            self.assertTrue(dones.all())
+            self.assertIn("wind_scenario", infos[0])
+            self.assertAlmostEqual(env.energy_j, env.turbine_energy_j.sum())
+        finally:
+            env.close()
+
+    def test_dynamic_wind_has_correct_ticks_and_no_uncommanded_heading_motion(self):
+        scenario = WindScenario([0, 4, 8, 12], [8, 9, 10, 8], [359, 361, 363, 365],
+                                mode="both", episode_seed=7)
+        env = two_env(episode_length=3)
+        try:
+            initial = env.reset(scenario=scenario)
+            headings = np.array([t.get_yaw_orientation() for t in env.interface.wind_farm.turbines])
+            np.testing.assert_allclose(headings, [359, 359])
+            self.assertEqual(env.wind_direction, 359)
+            for tick in range(1, 4):
+                obs, _, _, infos = env.step(np.zeros((2, 1)))
+                expected_speed, expected_direction = scenario.sample(tick * env.dt)
+                self.assertEqual(infos[0]["time_s"], tick * env.dt)
+                self.assertAlmostEqual(env.wind_speed, expected_speed)
+                self.assertAlmostEqual(env.wind_direction, expected_direction)
+                for turbine in env.interface.wind_farm.turbines:
+                    self.assertAlmostEqual(turbine.get_yaw_orientation(), 359)
+                    self.assertAlmostEqual(turbine.turbine_states.get_current_yaw(), tick * 2)
+                    ambient = turbine.ambient_states.get_all_states()
+                    self.assertAlmostEqual(ambient[0, 0], expected_speed)
+                    self.assertAlmostEqual(ambient[0, 1], 359 + tick * 2)
+                    self.assertAlmostEqual(ambient[1, 0], scenario.sample((tick - 1) * env.dt)[0])
+                    self.assertAlmostEqual(ambient[1, 1], 359 + (tick - 1) * 2)
+                self.assertTrue(np.isfinite(obs).all())
+            np.testing.assert_allclose(env.reset(scenario=scenario.to_dict()), initial)
+            self.assertEqual(env.wind_scenario.scenario_id, scenario.scenario_id)
+        finally:
+            env.close()
+
+    def test_dynamic_scenarios_are_seeded_and_explicit_replay_does_not_consume(self):
+        config = WindProfileConfig(mode="both", seed=91, knot_interval_s=4)
+        env = two_env(episode_length=2, wind_config=config)
+        other = two_env(episode_length=2, wind_config=config)
+        try:
+            first = env.make_scenario()
+            env.reset(scenario=first)
+            self.assertEqual(env.make_scenario().scenario_id, first.scenario_id)
+            env.reset()
+            self.assertEqual(env.wind_scenario.scenario_id, first.scenario_id)
+            second = env.make_scenario()
+            self.assertNotEqual(first.scenario_id, second.scenario_id)
+            self.assertEqual(other.make_scenario(1).scenario_id, second.scenario_id)
+        finally:
+            env.close()
+            other.close()
+
     def test_configured_wind_changes_aligned_reference(self):
         reference = []
         for speed in (8.0, 10.0):
-            env = WindFarmEnv(episode_length=4, wind_speed=speed)
+            env = two_env(episode_length=4, wind_speed=speed)
             try:
                 env.reset()
                 reference.append(env.get_individual_baseline_values(1.0))
@@ -28,7 +108,7 @@ class WindFarmEnvTests(unittest.TestCase):
     def test_aligned_reference_uses_local_wind_and_remaining_horizon(self):
         # No OFF simulation is started: values are read from FLORIS's turbine
         # curve and the critic's current local measurements.
-        env = WindFarmEnv(episode_length=4, wind_speed=8.0)
+        env = two_env(episode_length=4, wind_speed=8.0)
         env._iterator = object()
         env._steps = 0
         env._obs = np.array([[8.0, 270.0, 0.0], [6.0, 270.0, 0.0]], np.float32)
@@ -51,7 +131,7 @@ class WindFarmEnvTests(unittest.TestCase):
 
     def test_feedback_matches_prescribed_rollout(self):
         """Catch action timing errors by comparing to the existing batch wrapper."""
-        env = WindFarmEnv(episode_length=3)
+        env = two_env(episode_length=3)
         try:
             obs = env.reset()
             self.assertEqual(obs.shape, (2, 3))
@@ -98,7 +178,7 @@ class WindFarmEnvTests(unittest.TestCase):
             env.close()
 
     def test_rate_saturation_full_rotation_zero_power_and_reset(self):
-        env = WindFarmEnv(episode_length=16, wind_direction=359)
+        env = two_env(episode_length=16, wind_direction=359)
         try:
             initial = env.reset()
             for step in range(16):
@@ -125,7 +205,7 @@ class WindFarmEnvTests(unittest.TestCase):
             env.close()
 
     def test_exact_sideways_angles_and_one_turbine_still_generating(self):
-        env = WindFarmEnv(episode_length=4, dt=15.0)
+        env = two_env(episode_length=4, dt=15.0)
         try:
             env.reset()
             for step in range(4):
@@ -142,7 +222,7 @@ class WindFarmEnvTests(unittest.TestCase):
             env.close()
 
     def test_invalid_actions_do_not_advance(self):
-        env = WindFarmEnv(episode_length=1)
+        env = two_env(episode_length=1)
         try:
             env.reset()
             for invalid in ([1, 2], [[np.nan], [0]]):
@@ -175,6 +255,7 @@ class WindFarmEnvTests(unittest.TestCase):
     def test_observation_yaw_uses_local_velocity_not_ambient_direction(self):
         import pandas as pd
         env = WindFarmEnv.__new__(WindFarmEnv)
+        env.num_agents = env.num_agent = 2
         turbines = [SimpleNamespace(get_yaw_orientation=lambda: 270.0) for _ in range(2)]
         env.interface = SimpleNamespace(wind_farm=SimpleNamespace(turbines=turbines))
         env._iterator = iter([(pd.DataFrame({"Power_FLORIS": [1.0, 2.0]}), None,
@@ -185,7 +266,7 @@ class WindFarmEnvTests(unittest.TestCase):
         np.testing.assert_allclose(obs[1], [np.sqrt(17), direction, direction - 270], atol=2e-5)
 
     def test_critic_observation_includes_time_power_and_yaw_history(self):
-        env = WindFarmEnv(episode_length=10)
+        env = two_env(episode_length=10)
         env._iterator = iter(())  # get_centralized_obs only checks an active episode
         env._steps = 3
         env._obs = np.array([[8, 270, 3], [6, 268, -2]], dtype=np.float32)
@@ -202,7 +283,7 @@ class WindFarmEnvTests(unittest.TestCase):
         self.assertTrue(env.share_observation_space[0].contains(central))
 
     def test_yawed_wake_changes_downstream_observed_direction_after_travel(self):
-        env = WindFarmEnv(episode_length=42)
+        env = two_env(episode_length=42)
         try:
             initial = env.reset()
             early = None

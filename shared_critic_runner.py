@@ -128,6 +128,9 @@ class SharedCriticRunner(SeparatedRunner):
     def __init__(self, config):
         if not config["all_args"].use_centralized_V:
             raise ValueError("SharedCriticRunner requires the centralized value function.")
+        if any(len(getattr(config["envs"], name)) != config["num_agents"] for name in
+               ("action_space", "observation_space", "share_observation_space")):
+            raise ValueError("Runner agent count must match the environment spaces.")
         # Delay restoration until the original runner's policies are connected
         # to the shared critic and its single optimizer/normalizer.
         model_dir = config["all_args"].model_dir
@@ -159,6 +162,11 @@ class SharedCriticRunner(SeparatedRunner):
             (self.episode_length, self.n_rollout_threads, self.num_agents, 2), np.nan, dtype=np.float64)
         self._rollout_farm_power = np.full(
             (self.episode_length, self.n_rollout_threads), np.nan, dtype=np.float64)
+        self._rollout_conditions = [[{} for _ in range(self.n_rollout_threads)]
+                                    for _ in range(self.episode_length)]
+        self._episode_conditions = {}
+        self._scenario_events = set()
+        self.scenarios_path = Path(self.run_dir) / "wind_scenarios.jsonl"
         self.metrics_path = Path(self.run_dir) / "training_metrics.csv"
         self.rollout_path = Path(self.run_dir) / "rollout_steps.csv"
         self._csv_columns = ("episode", "environment_steps", "elapsed_seconds",
@@ -167,7 +175,8 @@ class SharedCriticRunner(SeparatedRunner):
                              "critic_value_loss", "critic_return_rmse", "critic_explained_variance",
                              "episode_energy_j", "episode_energy_mwh",
                              "cumulative_energy_j", "cumulative_energy_mwh",
-                             "episode_return", "episode_end_reward",
+                             "episode_return", "episode_end_reward", "scenario_id", "episode_seed",
+                             "wind_mode", "end_ambient_wind_speed_m_s", "end_ambient_wind_direction_deg",
                              *(f"actor{i}_individual_return" for i in range(self.num_agents)),
                              *(f"actor{i}_individual_value_loss" for i in range(self.num_agents)),
                              *(f"actor{i}_individual_value_rmse" for i in range(self.num_agents)))
@@ -177,7 +186,13 @@ class SharedCriticRunner(SeparatedRunner):
         # Return raw team values for GAE, but fit the network's per-remaining-
         # step output on normalized targets. The existing Adam retains the same
         # underlying parameters after wrapping.
-        self.critic = HorizonScaledCritic(self.policy[0].critic, self.episode_length, args.gamma)
+        remaining_indices = {getattr(env, "remaining_time_index", 3 * self.num_agents)
+                             for env in self.envs.envs}
+        if len(remaining_indices) != 1:
+            raise ValueError("All rollout environments must use the same critic feature order.")
+        self.remaining_time_index = remaining_indices.pop()
+        self.critic = HorizonScaledCritic(self.policy[0].critic, self.episode_length, args.gamma,
+                                           remaining_feature=self.remaining_time_index)
         self.critic_optimizer = self.policy[0].critic_optimizer
         for policy in self.policy:
             policy.critic = self.critic
@@ -248,11 +263,26 @@ class SharedCriticRunner(SeparatedRunner):
 
     def warmup(self):
         obs = self.envs.reset()
+        for i, env in enumerate(self.envs.envs):
+            if getattr(env, "wind_scenario", None) is not None:
+                self._register_scenario(env.wind_scenario.to_dict(), i, "reset")
         central = self._central_observations()
         self.individual_reference[0] = self._individual_references()
         for i, buffer in enumerate(self.buffer):
             buffer.share_obs[0] = central.copy()
             buffer.obs[0] = obs[:, i].copy()
+
+    def _register_scenario(self, scenario, environment_index, event, training_episode=None):
+        """Preserve full wind knots and seeds, including pending auto-resets."""
+        key = (scenario["scenario_id"], environment_index, event)
+        if key in self._scenario_events:
+            return
+        record = {"event": event, "environment_index": environment_index,
+                  "training_episode": (self._completed_episodes + 1 if training_episode is None
+                                       else training_episode), "scenario": scenario}
+        with self.scenarios_path.open("a", encoding="utf-8") as stream:
+            stream.write(json.dumps(record, allow_nan=False) + "\n")
+        self._scenario_events.add(key)
 
     def insert(self, data):
         # DummyVecEnv resets completed environments before returning. The info
@@ -272,6 +302,17 @@ class SharedCriticRunner(SeparatedRunner):
         self.individual_reference[step + 1] = self._individual_references()
         for env_index, env_infos in enumerate(infos):
             self._rollout_farm_power[step, env_index] = env_infos[0].get("farm_power_w", np.nan)
+            self._rollout_conditions[step][env_index] = {
+                key: env_infos[0].get(key, "") for key in
+                ("scenario_id", "episode_seed", "wind_mode", "ambient_wind_speed_m_s",
+                 "ambient_wind_direction_deg")}
+            self._episode_conditions = self._rollout_conditions[step][env_index].copy()
+            if "wind_scenario" in env_infos[0]:
+                self._register_scenario(env_infos[0]["wind_scenario"], env_index, "completed")
+                env = self.envs.envs[env_index]
+                if getattr(env, "wind_scenario", None) is not None:
+                    self._register_scenario(env.wind_scenario.to_dict(), env_index, "reset",
+                                            training_episode=self._completed_episodes + 2)
             for i, info in enumerate(env_infos):
                 self._rollout_physical[step, env_index, i] = (
                     info.get("yaw_rate_deg_s", np.nan), info.get("turbine_power_w", np.nan))
@@ -303,6 +344,10 @@ class SharedCriticRunner(SeparatedRunner):
                # Shared team reward: count one turbine, not both copies.
                "episode_return": float(self.buffer[0].rewards.sum(axis=0).mean()),
                "episode_end_reward": float(self.buffer[0].rewards[-1].mean())}
+        for key in ("scenario_id", "episode_seed", "wind_mode"):
+            row[key] = self._episode_conditions.get(key, "")
+        for key in ("ambient_wind_speed_m_s", "ambient_wind_direction_deg"):
+            row["end_" + key] = self._episode_conditions.get(key, "")
         for i, info in enumerate(infos):
             row[f"actor{i}_policy_loss"] = float(info["policy_loss"])
             row[f"actor{i}_ppo_clip_fraction"] = float(info["ppo_clip_fraction"])
@@ -331,6 +376,8 @@ class SharedCriticRunner(SeparatedRunner):
         # Observations/actions in buffers are at interval start; power and
         # applied rates from info belong to the corresponding interval end.
         fields = ["episode", "tick", "environment_index", "time_start_s", "time_end_s",
+                  "scenario_id", "episode_seed", "wind_mode", "ambient_wind_speed_m_s",
+                  "ambient_wind_direction_deg",
                   "farm_power_w", "team_reward", "team_value", "team_return_to_go",
                   "team_gae_advantage"]
         for i in range(self.num_agents):
@@ -355,6 +402,7 @@ class SharedCriticRunner(SeparatedRunner):
                            "team_value": team_values[step, env_index, 0],
                            "team_return_to_go": team_returns[step, env_index, 0],
                            "team_gae_advantage": team_advantage[step, env_index, 0]}
+                    row.update(self._rollout_conditions[step][env_index])
                     for i, buffer in enumerate(self.buffer):
                         speed, direction, yaw = buffer.obs[step, env_index]
                         mixed = mixed_advantages[i]
@@ -519,15 +567,23 @@ class SharedCriticRunner(SeparatedRunner):
         for key, value in self._critic_info.items():
             self.writter.add_scalar(f"critic/{key}", value, total_num_steps)
 
-    def save(self):
-        directory = Path(self.save_dir)
-        (directory / "checkpoint_metadata.json").write_text(json.dumps({
-            "format_version": 5,
+    def _checkpoint_metadata(self):
+        env = self.envs.envs[0]
+        layout = getattr(env, "layout_d", None)
+        return {
+            "format_version": 6, "num_agents": self.num_agents,
             "action_head": "tanh_squashed_gaussian",
             "critic_observation_shape": list(self.envs.share_observation_space[0].shape),
+            "remaining_time_index": self.remaining_time_index,
+            "layout_d": None if layout is None else np.asarray(layout).tolist(),
+            "total_rated_power_w": getattr(env, "total_rated_power_w", None),
             "individual_value": "aligned_reference_plus_discounted_remaining_horizon_residual",
             "team_value": "discounted_remaining_horizon_times_per_step_value",
-        }, indent=2))
+        }
+
+    def save(self):
+        directory = Path(self.save_dir)
+        (directory / "checkpoint_metadata.json").write_text(json.dumps(self._checkpoint_metadata(), indent=2))
         for i, policy in enumerate(self.policy):
             torch.save(policy.actor.state_dict(), directory / f"actor_agent{i}.pt")
             torch.save(self.individual_critics[i].state_dict(), directory / f"individual_critic_agent{i}.pt")
@@ -542,9 +598,9 @@ class SharedCriticRunner(SeparatedRunner):
         if not metadata_path.is_file():
             raise ValueError("Checkpoint predates the bounded action head and expanded critic state; start a new run.")
         metadata = json.loads(metadata_path.read_text())
-        if (metadata.get("format_version") != 5 or
-                metadata.get("critic_observation_shape") != list(self.envs.share_observation_space[0].shape)):
-            raise ValueError("Incompatible checkpoint; horizon-scaled critics require format 5.")
+        expected = self._checkpoint_metadata()
+        if any(metadata.get(key) != value for key, value in expected.items()):
+            raise ValueError("Incompatible checkpoint; format 6 requires matching agent count, layout, ratings and critic schema.")
         if not (directory / "critic.pt").is_file():
             raise ValueError("Expected a shared-critic checkpoint (critic.pt); start a new run for old checkpoints.")
         for i, policy in enumerate(self.policy):

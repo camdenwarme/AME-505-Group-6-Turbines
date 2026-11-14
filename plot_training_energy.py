@@ -8,7 +8,7 @@ from matplotlib.backends.backend_agg import FigureCanvasAgg
 from matplotlib.figure import Figure
 from matplotlib.ticker import MaxNLocator
 import numpy as np
-from plot_rewards import evaluation_series
+from plot_rewards import evaluation_series, evaluation_baseline_label
 
 
 def plot_training_energy(metrics_path):
@@ -39,7 +39,7 @@ def plot_training_energy(metrics_path):
         all_episodes.extend(eval_episodes)
     if baseline is not None:
         axis.axhline(baseline, color="#536276", linestyle="--", linewidth=1.2,
-                     label="Aligned baseline")
+                     label=evaluation_baseline_label(metrics_path.parent))
         values.append(baseline)
     axis.set_title("Farm energy within each episode", loc="left",
                    fontsize=12, weight="bold")

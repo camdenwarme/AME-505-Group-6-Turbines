@@ -2,6 +2,7 @@
 
 from pathlib import Path
 import csv
+import json
 import random
 import sys
 import tempfile
@@ -18,6 +19,7 @@ from config import get_config
 from envs.env_wrappers import DummyVecEnv
 from shared_critic_runner import (SharedCriticRunner, _critic_return_diagnostics,
                                   _discounted_horizons, _individual_gae, _individual_values)
+from wind_profiles import WindScenario
 
 
 class _Farm:
@@ -51,7 +53,151 @@ class _Farm:
         pass
 
 
+class _FourFarm:
+    """Four distinct local rewards, replay metadata, and the real critic schema."""
+
+    dt = 4.0
+    num_agents = 4
+    remaining_time_index = 12
+    total_rated_power_w = 40e6
+    layout_d = np.array([[0, 0, 0], [0, 5, 0], [5, 0, 0], [5, 5, 0]], float)
+    observation_space = [spaces.Box(-np.inf, np.inf, (3,), np.float32) for _ in range(4)]
+    share_observation_space = [spaces.Box(-np.inf, np.inf, (37,), np.float32) for _ in range(4)]
+    action_space = [spaces.Box(-6, 6, (1,), np.float32) for _ in range(4)]
+
+    def __init__(self):
+        self.episode = -1
+
+    def _obs(self):
+        return np.column_stack(([8, 7, 6, 5], np.full(4, 270 + self.t),
+                                np.arange(1, 5) * self.t)).astype(np.float32)
+
+    def reset(self):
+        self.t, self.energy_j = 0, 0.0
+        self.episode += 1
+        self.wind_scenario = WindScenario([0, 16], [8, 9], [270, 280], mode="both",
+                                          episode_id=self.episode, episode_seed=100 + self.episode)
+        return self._obs()
+
+    def get_centralized_obs(self):
+        return np.concatenate(((self._obs() / [10, 360, 180]).reshape(-1),
+                               [1 - self.t / 4], [.15, .27, .31, .43],
+                               np.zeros(20))).astype(np.float32)
+
+    def get_individual_baseline_values(self, gamma):
+        return np.array([.1, .2, .3, .4], np.float32) * sum(gamma ** n for n in range(4 - self.t))
+
+    def step(self, actions):
+        self.t += 1
+        rewards = (np.array([.15, .27, .31, .43], np.float32) + .01 * self.t).reshape(4, 1)
+        self.energy_j += float(rewards.sum()) * 10e6 * self.dt
+        speed, direction = self.wind_scenario.sample(self.t * self.dt)
+        infos = [{"episode_energy_j": self.energy_j, "team_reward": float(rewards.mean()),
+                  "farm_power_w": float(rewards.sum()) * 10e6,
+                  "turbine_power_w": float(rewards[i, 0]) * 10e6,
+                  "yaw_rate_deg_s": float(actions[i][0]),
+                  "scenario_id": self.wind_scenario.scenario_id,
+                  "episode_seed": self.wind_scenario.episode_seed, "wind_mode": "both",
+                  "ambient_wind_speed_m_s": speed, "ambient_wind_direction_deg": direction}
+                 for i in range(4)]
+        if self.t == 4:
+            infos[0]["wind_scenario"] = self.wind_scenario.to_dict()
+        return self._obs(), rewards, np.full(4, self.t == 4), infos
+
+    def close(self):
+        pass
+
+
 class SharedCriticTests(unittest.TestCase):
+    def test_four_agent_updates_time_feature_and_completed_scenario_survive_auto_reset(self):
+        torch.set_num_threads(1)
+        torch.manual_seed(29)
+        np.random.seed(29)
+        with tempfile.TemporaryDirectory() as directory:
+            args = get_config().parse_args([])
+            args.use_valuenorm = False
+            args.use_feature_normalization = False
+            args.episode_length, args.num_env_steps, args.n_rollout_threads = 4, 4, 1
+            args.ppo_epoch, args.num_mini_batch = 2, 2
+            args.gamma = 1.0
+            envs = DummyVecEnv([_FourFarm])
+            runner = SharedCriticRunner({"all_args": args, "envs": envs, "eval_envs": None,
+                                         "num_agents": 4, "device": torch.device("cpu"),
+                                         "run_dir": Path(directory)})
+            try:
+                runner.warmup()
+                completed_id = envs.envs[0].wind_scenario.scenario_id
+                self.assertEqual(runner.remaining_time_index, 12)
+                self.assertEqual(runner.buffer[0].share_obs.shape[-1], 37)
+                self.assertEqual(len({id(p.actor) for p in runner.policy}), 4)
+                self.assertEqual(len({id(c) for c in runner.individual_critics}), 4)
+                self.assertTrue(all(p.critic is runner.critic for p in runner.policy))
+                for tick in range(4):
+                    values, actions, log_probs, states, critic_states, commands = runner.collect(tick)
+                    self.assertEqual(actions.shape, (1, 4, 1))
+                    self.assertTrue(np.all(np.abs(actions) < 6))
+                    obs, rewards, dones, infos = envs.step(commands)
+                    runner.insert((obs, rewards, dones, infos, values, actions,
+                                   log_probs, states, critic_states))
+                next_id = envs.envs[0].wind_scenario.scenario_id
+                self.assertNotEqual(completed_id, next_id)
+                self.assertEqual(runner.buffer[0].masks[-1, 0, 0], 0)
+                # Last action state has one step left, while the done slot is
+                # the next episode's initial state and is masked for bootstrap.
+                horizon = runner.critic.horizon(runner.buffer[0].share_obs[-2])
+                torch.testing.assert_close(horizon, torch.ones_like(horizon))
+                self.assertEqual(runner.buffer[0].share_obs[-1, 0, 12], 1)
+                runner.compute()
+                actor_before = [[p.detach().clone() for p in policy.actor.parameters()]
+                                for policy in runner.policy]
+                individual_before = [[p.detach().clone() for p in critic.parameters()]
+                                     for critic in runner.individual_critics]
+                critic_before = [p.detach().clone() for p in runner.critic.parameters()]
+                with patch.object(runner.critic_optimizer, "step",
+                                  wraps=runner.critic_optimizer.step) as shared_step:
+                    infos = runner.train()
+                    self.assertEqual(shared_step.call_count, args.ppo_epoch * args.num_mini_batch)
+                for actor, before in zip((p.actor for p in runner.policy), actor_before):
+                    self.assertTrue(any(not torch.equal(a, b) for a, b in zip(before, actor.parameters())))
+                for critic, before in zip(runner.individual_critics, individual_before):
+                    self.assertTrue(any(not torch.equal(a, b) for a, b in zip(before, critic.parameters())))
+                self.assertTrue(any(not torch.equal(a, b) for a, b in zip(critic_before, runner.critic.parameters())))
+                records = [json.loads(line) for line in runner.scenarios_path.read_text().splitlines()]
+                completed = [row for row in records if row["event"] == "completed"]
+                self.assertEqual(len(completed), 1)
+                self.assertEqual(completed[0]["scenario"]["scenario_id"], completed_id)
+                self.assertTrue(any(row["event"] == "reset" and row["scenario"]["scenario_id"] == next_id
+                                    for row in records))
+                with runner.metrics_path.open(newline="") as stream:
+                    metric = list(csv.DictReader(stream))[0]
+                self.assertEqual(metric["scenario_id"], completed_id)
+                self.assertEqual(metric["episode_seed"], "100")
+                with runner.rollout_path.open(newline="") as stream:
+                    steps = list(csv.DictReader(stream))
+                self.assertEqual(len(steps), 4)
+                self.assertTrue(all(row["scenario_id"] == completed_id for row in steps))
+                self.assertIn("actor3_individual_value", steps[0])
+                runner.save()
+                models = Path(runner.save_dir)
+                runner.model_dir = models
+                metadata_path = models / "checkpoint_metadata.json"
+                metadata = json.loads(metadata_path.read_text())
+                self.assertEqual(metadata["format_version"], 6)
+                self.assertEqual(metadata["num_agents"], 4)
+                self.assertEqual(metadata["remaining_time_index"], 12)
+                self.assertEqual(metadata["total_rated_power_w"], 40e6)
+                self.assertEqual(metadata["critic_observation_shape"], [37])
+                runner.restore()
+                for key, bad in (("num_agents", 2), ("layout_d", [[0, 0, 0]] * 4)):
+                    changed = {**metadata, key: bad}
+                    metadata_path.write_text(json.dumps(changed))
+                    with self.assertRaisesRegex(ValueError, "Incompatible checkpoint"):
+                        runner.restore()
+                metadata_path.write_text(json.dumps(metadata))
+            finally:
+                runner.writter.close()
+                envs.close()
+
     def test_individual_value_residual_respects_remaining_horizon(self):
         horizons = _discounted_horizons(3, 0.5)
         np.testing.assert_allclose(horizons.reshape(-1), [1.75, 1.5, 1, 0])

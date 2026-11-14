@@ -1,6 +1,8 @@
 """Plot cumulative farm energy within individual evaluation episodes."""
 
 import argparse
+import csv
+import json
 from pathlib import Path
 import re
 
@@ -42,8 +44,8 @@ def plot_evaluation_energy(times, energy_j, output_dir, episode, source="simulat
 def regenerate_evaluation_energy(run_dir):
     """Use saved energy, or invert this environment's reward normalization.
 
-    Older reward-only evaluations used reward = interval_energy / (20 MW * dt).
-    Reconstruction has only the rounding error in the saved float32 rewards.
+    Reward-only reconstruction uses the recorded farm rating (historically
+    20 MW for two turbines). It has the saved float32 reward rounding error.
     """
     run_dir = Path(run_dir)
     outputs = []
@@ -60,10 +62,31 @@ def regenerate_evaluation_energy(run_dir):
         else:
             with np.load(path, allow_pickle=False) as data:
                 times = np.concatenate(([0.0], data["time_s"]))
-                energy = np.concatenate(([0.0], np.cumsum(data["reward"] * 20e6 * np.diff(times))))
+                rating = _farm_rating(run_dir, episode)
+                energy = np.concatenate(([0.0], np.cumsum(data["reward"] * rating * np.diff(times))))
                 source = "recorded_rewards"
         outputs.append(plot_evaluation_energy(times, energy, run_dir, episode, source))
     return outputs
+
+
+def _farm_rating(run_dir, episode):
+    """Recover normalization from recorded metadata, never assume two turbines."""
+    metrics = run_dir / "evaluation_metrics.csv"
+    if metrics.exists():
+        with metrics.open(newline="", encoding="utf-8") as stream:
+            for row in csv.DictReader(stream):
+                if int(row["episode"]) == episode and row.get("farm_rated_power_w"):
+                    return float(row["farm_rated_power_w"])
+    config_path = run_dir / "config.json"
+    if config_path.exists():
+        config = json.loads(config_path.read_text())
+        if "total_rated_power_w" in config:
+            return float(config["total_rated_power_w"])
+        if "farm_rated_power_w" in config:
+            return float(config["farm_rated_power_w"])
+        if "num_agents" in config:
+            return int(config["num_agents"]) * float(config.get("turbine_rated_power_w", 10e6))
+    raise ValueError("Reward-only energy reconstruction requires recorded farm rating or agent count.")
 
 
 if __name__ == "__main__":

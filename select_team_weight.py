@@ -9,6 +9,7 @@ import csv
 import json
 import math
 from pathlib import Path
+import re
 from statistics import mean
 
 
@@ -41,32 +42,58 @@ def read_pilot(directory):
     final = [row for row in greedy if int(row["episode"]) == episode]
     if len(before) != 1 or len(final) != 1:
         raise ValueError(f"{directory}: require exactly one initial and final greedy evaluation")
+    before_scenario, final_scenario = before[0].get("scenario_id", ""), final[0].get("scenario_id", "")
+    if before_scenario != final_scenario:
+        raise ValueError(f"{directory}: initial and final evaluations used different wind scenarios")
     weight = _finite(config.get("team_reward_weight"), "team_reward_weight", directory)
     if not 0 <= weight <= 1:
         raise ValueError(f"{directory}: team weight outside [0, 1]")
     def metrics(row):
-        return {field: _finite(row.get(field), field, directory) for field in
-                ("farm_energy_mwh", "turbine0_energy_mwh", "turbine1_energy_mwh")}
+        fields = ["farm_energy_mwh"] + sorted(
+            (key for key in row if re.fullmatch(r"turbine\d+_energy_mwh", key)),
+            key=lambda key: int(key.split("_")[0][7:]))
+        expected_count = int(config.get("num_agents", len(fields) - 1))
+        if len(fields) - 1 != expected_count:
+            raise ValueError(f"{directory}: missing per-turbine energy fields")
+        return {field: _finite(row.get(field), field, directory) for field in fields}
     return {"path": str(directory), "config": config, "weight": weight,
             "seed": int(config["seed"]), "training_episodes": episode,
+            "evaluation_scenario_id": final_scenario,
             "environment_steps": int(training[-1]["environment_steps"]),
             "greedy_evaluation_count": len(greedy), "initial_greedy": metrics(before[0]),
             "final_greedy": metrics(final[0])}
 
 
+def _config_signature(config, *, across_seeds):
+    """Keep all treatment settings, optionally excluding independent RNG seeds."""
+    omitted = {"team_reward_weight", "experiment_name"}
+    if across_seeds:
+        omitted.update(("seed", "wind_seed", "eval_wind_seed"))
+    signature = {key: value for key, value in config.items() if key not in omitted}
+    if across_seeds:
+        for key in ("training_wind_config", "evaluation_wind_config"):
+            if isinstance(signature.get(key), dict):
+                signature[key] = {name: value for name, value in signature[key].items() if name != "seed"}
+    return signature
+
+
+def _require_matching_configs(pilots, *, across_seeds):
+    reference = _config_signature(pilots[0]["config"], across_seeds=across_seeds)
+    for pilot in pilots[1:]:
+        common = _config_signature(pilot["config"], across_seeds=across_seeds)
+        differences = sorted(key for key in set(reference) | set(common)
+                             if reference.get(key) != common.get(key))
+        if differences:
+            raise ValueError(f"{pilot['path']}: unmatched configuration fields: {', '.join(differences)}")
+
+
 def select(pilots):
     if not pilots:
         raise ValueError("Pass at least one pilot run directory")
-    # Enforce common rollout, optimizer, environment and evaluation settings;
-    # only seed, weight, and run label may differ between candidates.
-    omitted = {"seed", "team_reward_weight", "experiment_name"}
-    reference = {k: v for k, v in pilots[0]["config"].items() if k not in omitted}
-    for pilot in pilots[1:]:
-        common = {k: v for k, v in pilot["config"].items() if k not in omitted}
-        differences = sorted(k for k in set(reference) | set(common)
-                             if reference.get(k) != common.get(k))
-        if differences:
-            raise ValueError(f"{pilot['path']}: unmatched configuration fields: {', '.join(differences)}")
+    # Across independent seeds permit model/wind/evaluation RNG seeds to vary,
+    # including the repeated seeds in serialized wind configs. Every other
+    # rollout, optimizer and wind-distribution setting must remain identical.
+    _require_matching_configs(pilots, across_seeds=True)
     groups = {}
     for pilot in pilots:
         group = groups.setdefault(pilot["weight"], {})
@@ -76,6 +103,13 @@ def select(pilots):
     expected_seeds = set(next(iter(groups.values())))
     if any(set(group) != expected_seeds for group in groups.values()):
         raise ValueError("All candidate weights must use the same set of seeds")
+    for seed in expected_seeds:
+        # Candidate weights for one seed must share *exactly* the same RNG
+        # settings, not merely the same realized evaluation scenario string.
+        _require_matching_configs([group[seed] for group in groups.values()], across_seeds=False)
+        scenarios = {group[seed].get("evaluation_scenario_id", "") for group in groups.values()}
+        if len(scenarios) != 1:
+            raise ValueError(f"Candidate weights used different evaluation wind scenarios for seed {seed}")
     summaries = []
     for weight, group in sorted(groups.items()):
         runs = [group[seed] for seed in sorted(group)]

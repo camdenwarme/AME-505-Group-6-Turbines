@@ -1,4 +1,4 @@
-"""Two-turbine, closed-loop OFF environment for light_mappo.
+"""Configurable multi-turbine, closed-loop OFF environment for light_mappo.
 
 Actors observe [local wind speed (m/s), local direction (meteorological
 degrees), wind-relative yaw (degrees in [-180, 180))]. Actions are heading
@@ -20,25 +20,28 @@ from gym import spaces
 import yaml
 
 from fdynsim import DEFAULT_CASE, REPO
+from wind_profiles import WindProfileConfig, WindScenario, make_wind_scenario
 
 
 class _YawRateController:
-    def __init__(self, dt, direction):
+    def __init__(self, dt, direction, num_agents, prepare_next_tick):
         self.dt, self.direction = dt, direction
-        self.rates = np.zeros(2)
-        self.applied_rates = np.zeros(2)
+        self.headings = np.full(num_agents, direction, dtype=float)
+        self.rates = np.zeros(num_agents)
+        self.applied_rates = np.zeros(num_agents)
+        self._prepare_next_tick = prepare_next_tick
 
     def update(self, t):
-        pass
+        self.direction = self._prepare_next_tick(t + self.dt)
 
     def __call__(self, turbine, i_t, t):
         # Keep yaw history unwrapped so interpolation remains continuous when
         # crossing +/-180 or making full turns. Only the displayed heading wraps.
-        offset = -turbine.turbine_states.get_current_yaw()
-        new_offset = offset + self.rates[i_t] * self.dt
+        self.headings[i_t] += self.rates[i_t] * self.dt
         self.applied_rates[i_t] = self.rates[i_t]
-        # set_yaw uses OFF's wind-minus-heading convention, including angle wrap.
-        turbine.set_yaw(self.direction, -new_offset)
+        # Wind changes alter relative yaw, not the absolute rotor heading. Both
+        # wind direction and heading stay unwrapped in OFF's historical chain.
+        turbine.set_yaw(self.direction, self.direction - self.headings[i_t])
 
     def get_applied_settings(self, turbine, i_t, t):
         import pandas as pd
@@ -47,7 +50,7 @@ class _YawRateController:
 
 
 class WindFarmEnv:
-    num_agent = 2
+    default_layout_d = ((0.0, 0.0), (0.0, 5.0), (5.0, 0.0), (5.0, 5.0))
     # OFF keeps a chain of previous turbine states used to construct wakes.
     # Fixed lag samples give the centralized critic some wake context without
     # exposing the changing-length simulator chain to the decentralized actors.
@@ -55,7 +58,8 @@ class WindFarmEnv:
     turbine_rated_power_w = 10e6
 
     def __init__(self, episode_length=200, dt=4.0, wind_speed=8.0,
-                 wind_direction=270.0):
+                 wind_direction=270.0, layout=None, wind_config=None,
+                 wind_stream=0, environment_id=0):
         if (not np.isfinite([dt, wind_speed, wind_direction]).all()
                 or dt <= 0 or wind_speed <= 0
                 or episode_length < 1 or int(episode_length) != episode_length):
@@ -63,6 +67,25 @@ class WindFarmEnv:
         self.episode_length = int(episode_length)
         self.dt, self.wind_speed = float(dt), float(wind_speed)
         self.wind_direction = float(wind_direction) % 360
+        self.base_wind_speed, self.base_wind_direction = self.wind_speed, self.wind_direction
+        self.layout_d = np.asarray(self.default_layout_d if layout is None else layout, dtype=float)
+        if (self.layout_d.ndim != 2 or self.layout_d.shape[1] not in (2, 3)
+                or len(self.layout_d) < 1 or not np.isfinite(self.layout_d).all()):
+            raise ValueError("layout must contain finite [x, y] or [x, y, z] rows in rotor diameters.")
+        if self.layout_d.shape[1] == 2:
+            self.layout_d = np.column_stack((self.layout_d, np.zeros(len(self.layout_d))))
+        if len(np.unique(self.layout_d, axis=0)) != len(self.layout_d):
+            raise ValueError("Turbine positions must be distinct.")
+        self.layout_d = self.layout_d.copy()
+        self.num_agents = self.num_agent = len(self.layout_d)
+        self.remaining_time_index = 3 * self.num_agents
+        self.total_rated_power_w = self.num_agents * self.turbine_rated_power_w
+        self.wind_config = WindProfileConfig() if wind_config is None else wind_config
+        if not isinstance(self.wind_config, WindProfileConfig):
+            raise ValueError("wind_config must be a WindProfileConfig.")
+        self.wind_stream, self.environment_id = int(wind_stream), int(environment_id)
+        self._next_episode_id = 0
+        self.wind_scenario = self.current_scenario = None
         # FLORIS supplies this same table for the iea_10MW turbine used in the
         # case. Reading it does not invoke or advance the wake simulator.
         turbine_type = yaml.safe_load(DEFAULT_CASE.read_text())["wind_farm"]["farm"]["turbine_type"][0]
@@ -70,21 +93,43 @@ class WindFarmEnv:
         table = yaml.safe_load(curve_path.read_text())["power_thrust_table"]
         self._aligned_curve_speeds = np.asarray(table["wind_speed"], dtype=float)
         self._aligned_curve_power_w = np.asarray(table["power"], dtype=float) * 1000.0
-        self.action_space = [spaces.Box(-6.0, 6.0, (1,), np.float32) for _ in range(2)]
+        self.action_space = [spaces.Box(-6.0, 6.0, (1,), np.float32) for _ in range(self.num_agents)]
         self.observation_space = [
             spaces.Box(np.array([0, 0, -180], np.float32),
-                       np.array([np.inf, 360, 180], np.float32)) for _ in range(2)]
-        # [scaled actor observations (6), remaining fraction (1), each current
-        # power / rated power (2), yaw history (5 samples x 2 turbines)].
-        central_size = 6 + 1 + 2 + 2 * len(self.critic_yaw_history_lags)
+                       np.array([np.inf, 360, 180], np.float32)) for _ in range(self.num_agents)]
+        central_size = self.num_agents * (4 + len(self.critic_yaw_history_lags)) + 1
         self.share_observation_space = [spaces.Box(-np.inf, np.inf, (central_size,),
-                                                    dtype=np.float32) for _ in range(2)]
+                                                    dtype=np.float32) for _ in range(self.num_agents)]
         self._iterator = self._temporary = self.interface = None
         self._handlers = []
 
     def seed(self, seed):
+        # Policy exploration uses torch; wind generation uses wind_config.seed.
         for i, space in enumerate(self.action_space):
             space.seed(seed + i)
+
+    def make_scenario(self, episode_id=None):
+        """Create an explicit replayable scenario without consuming an episode."""
+        return make_wind_scenario(self.wind_config, self.episode_length * self.dt,
+                                  self.base_wind_speed, self.base_wind_direction,
+                                  self._next_episode_id if episode_id is None else episode_id,
+                                  stream_id=self.wind_stream, environment_id=self.environment_id)
+
+    def _prepare_next_tick(self, time_s):
+        """Apply ambient wind to the new history head for the next measurement.
+
+        OFF invokes controller.update after propagating existing histories. Its
+        constant initial feed remains the same buffer, so updating that buffer
+        here preserves old ambient states instead of overwriting the whole chain.
+        """
+        self.wind_speed, self.wind_direction = self.wind_scenario.sample(time_s)
+        direction = self.wind_scenario.direction_unwrapped(time_s)
+        corrector = self.interface.off_sim.ambient_corrector
+        corrector.buffer[:, corrector.state_id.index("wind_speeds")] = self.wind_speed
+        corrector.buffer[:, corrector.state_id.index("wind_directions")] = direction
+        for i, turbine in enumerate(self.interface.wind_farm.turbines):
+            corrector(i, turbine.ambient_states)
+        return direction
 
     @contextmanager
     def _scope(self):
@@ -98,8 +143,19 @@ class WindFarmEnv:
         finally:
             os.chdir(previous)
 
-    def reset(self):
+    def reset(self, scenario=None):
         self.close()
+        if scenario is None:
+            scenario = self.make_scenario()
+            self._next_episode_id += 1
+        elif isinstance(scenario, dict):
+            scenario = WindScenario.from_dict(scenario)
+        if not isinstance(scenario, WindScenario):
+            raise ValueError("scenario must be a WindScenario or its serialized dictionary.")
+        if not np.isclose(scenario.times_s[-1], self.episode_length * self.dt):
+            raise ValueError("Wind scenario duration must match the episode duration.")
+        self.wind_scenario = self.current_scenario = scenario
+        self.wind_speed, self.wind_direction = scenario.sample(0.0)
         import matplotlib
         matplotlib.use("Agg")
         import floris  # noqa: F401 -- OFF checks the imported native package
@@ -112,14 +168,20 @@ class WindFarmEnv:
 
         settings = yaml.safe_load(DEFAULT_CASE.read_text())
         farm = settings["wind_farm"]["farm"]
-        # Keep the original turbine model and 5D spacing; only two turbines.
-        farm.update(layout_x=[0.0, 5.0], layout_y=[0.0, 0.0],
-                    layout_z=[0.0, 0.0], turbine_type=[farm["turbine_type"][0]] * 2)
+        farm.update(layout_x=self.layout_d[:, 0].tolist(), layout_y=self.layout_d[:, 1].tolist(),
+                    layout_z=self.layout_d[:, 2].tolist(),
+                    turbine_type=[farm["turbine_type"][0]] * self.num_agents)
+        # Retain padding around the configured farm in the native case bounds.
+        farm["boundaries_xyz"] = [float(self.layout_d[:, 0].min() - 2),
+                                  float(self.layout_d[:, 0].max() + 2),
+                                  float(self.layout_d[:, 1].min() - 2),
+                                  float(self.layout_d[:, 1].max() + 2), 0.0, 5.0]
         settings["sim"]["sim"].update({"time start": 0.0,
             "time end": self.episode_length * self.dt, "time step": self.dt})
         settings["ambient"]["flow_field"].update(
             wind_speeds=[self.wind_speed], wind_speeds_t=[0.0],
-            wind_directions=[self.wind_direction], wind_directions_t=[0.0])
+            wind_directions=[self.wind_direction], wind_directions_t=[0.0],
+            corr_overwrite_direction=False)
         settings["controller"]["settings"] = {"ctl": "IdealGreedyBaseline"}
         settings["vis"]["flow_field_plots"]["plot"] = False
         for key in ("effective_wf_layout", "effective_wf_tile", "turbine_effective_wind_speed"):
@@ -142,11 +204,12 @@ class WindFarmEnv:
                     turbine.set_yaw(self.wind_direction, 0.0)
                     turbine.turbine_states.init_all_states(
                         turbine.turbine_states.get_all_states()[0].copy())
-                self.controller = _YawRateController(self.dt, self.wind_direction)
+                self.controller = _YawRateController(self.dt, scenario.direction_unwrapped(0.0),
+                                                     self.num_agents, self._prepare_next_tick)
                 sim.controller = self.controller
                 self._iterator = sim.iter_sim()
                 self._steps, self.energy_j = 0, 0.0
-                self.turbine_energy_j = np.zeros(2, dtype=float)
+                self.turbine_energy_j = np.zeros(self.num_agents, dtype=float)
                 obs, self._power = self._measure()
                 self._previous_turbine_power = self._turbine_power.copy()
                 self._obs = obs.copy()
@@ -161,9 +224,11 @@ class WindFarmEnv:
 
     def _measure(self):
         measurements, _, velocity = next(self._iterator)
-        latest = measurements.tail(2)
+        latest = measurements.tail(self.num_agents)
         if "t_idx" in latest.columns:
             latest = latest.sort_values("t_idx")
+            if not np.array_equal(latest["t_idx"].to_numpy(), np.arange(self.num_agents)):
+                raise RuntimeError("OFF must provide exactly one current measurement per turbine.")
         self._turbine_power = latest["Power_FLORIS"].to_numpy(dtype=float)
         power = float(np.sum(self._turbine_power))
         speed = np.linalg.norm(velocity, axis=1)
@@ -175,7 +240,8 @@ class WindFarmEnv:
         # lateral flow, not a vector reconstructed from ambient direction.
         yaw = (direction - headings + 180) % 360 - 180
         obs = np.column_stack((speed, direction, yaw)).astype(np.float32)
-        if self._turbine_power.shape != (2,) or not np.isfinite(obs).all() or not np.isfinite(power):
+        if (self._turbine_power.shape != (self.num_agents,) or obs.shape != (self.num_agents, 3)
+                or not np.isfinite(obs).all() or not np.isfinite(power)):
             raise RuntimeError("OFF produced invalid local wind or FLORIS power.")
         return obs, power
 
@@ -230,8 +296,8 @@ class WindFarmEnv:
         if self._iterator is None or self._steps >= self.episode_length:
             raise RuntimeError("Call reset() before stepping a new episode.")
         rates = np.asarray(actions, dtype=float)
-        if rates.shape != (2, 1) or not np.isfinite(rates).all():
-            raise ValueError("Expected two finite yaw rates with shape (2, 1).")
+        if rates.shape != (self.num_agents, 1) or not np.isfinite(rates).all():
+            raise ValueError(f"Expected finite yaw rates with shape ({self.num_agents}, 1).")
         # Preserve the runner's original samples/log probabilities in its buffer;
         # actuator saturation is part of the environment transition.
         self.controller.rates = np.clip(rates[:, 0], -6, 6)
@@ -246,9 +312,9 @@ class WindFarmEnv:
         self.turbine_energy_j += turbine_interval_energy
         self._steps += 1
         # Each actor receives its turbine's interval energy / (10 MW * dt).
-        # Team reward is farm energy / (20 MW * dt), the mean of the two.
-        rewards = (turbine_interval_energy / (self.turbine_rated_power_w * self.dt)).astype(np.float32).reshape(2, 1)
-        team_reward = interval_energy / (2 * self.turbine_rated_power_w * self.dt)
+        # Team reward is farm energy / (sum of turbine ratings * dt).
+        rewards = (turbine_interval_energy / (self.turbine_rated_power_w * self.dt)).astype(np.float32).reshape(self.num_agents, 1)
+        team_reward = interval_energy / (self.total_rated_power_w * self.dt)
         done = self._steps == self.episode_length
         infos = [{"farm_power_w": power, "interval_energy_j": interval_energy,
                   "episode_energy_j": self.energy_j,
@@ -256,9 +322,18 @@ class WindFarmEnv:
                   "turbine_interval_energy_j": float(turbine_interval_energy[i]),
                   "turbine_episode_energy_j": float(self.turbine_energy_j[i]),
                   "team_reward": team_reward,
-                  "yaw_rate_deg_s": float(self.controller.applied_rates[i])}
-                 for i in range(2)]
-        return obs, rewards, np.full(2, done, dtype=bool), infos
+                  "yaw_rate_deg_s": float(self.controller.applied_rates[i]),
+                  "ambient_wind_speed_m_s": float(self.wind_speed),
+                  "ambient_wind_direction_deg": float(self.wind_direction),
+                  "time_s": self._steps * self.dt,
+                  "scenario_id": self.wind_scenario.scenario_id,
+                  "episode_seed": self.wind_scenario.episode_seed,
+                  "wind_episode_id": self.wind_scenario.episode_id,
+                  "wind_mode": self.wind_scenario.mode}
+                 for i in range(self.num_agents)]
+        if done:
+            infos[0]["wind_scenario"] = self.wind_scenario.to_dict()
+        return obs, rewards, np.full(self.num_agents, done, dtype=bool), infos
 
     def close(self):
         if self._iterator is not None:

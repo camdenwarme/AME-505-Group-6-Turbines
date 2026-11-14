@@ -1,10 +1,11 @@
-"""Train the two-turbine environment using an adjacent light_mappo checkout."""
+"""Train a configurable wind farm using an adjacent light_mappo checkout."""
 
 import argparse
 import csv
 from importlib import metadata
 import json
 from pathlib import Path
+import random
 import sys
 
 ROOT = Path(__file__).resolve().parent
@@ -15,6 +16,20 @@ def main():
     bootstrap.add_argument("--mappo-path", type=Path, default=ROOT.parent / "light_mappo")
     bootstrap.add_argument("--wind-speed", type=float, default=8.0)
     bootstrap.add_argument("--wind-direction", type=float, default=270.0)
+    bootstrap.add_argument("--layout-file", type=Path, default=None,
+                           help="JSON array of [x,y] or [x,y,z] turbine positions in rotor diameters; default square4.")
+    bootstrap.add_argument("--wind-mode", choices=("off", "speed", "direction", "both"), default="off",
+                           help="Toggle seeded, time-varying wind inside every episode.")
+    bootstrap.add_argument("--wind-seed", type=int, default=None,
+                           help="Training wind seed; defaults to the model seed.")
+    bootstrap.add_argument("--eval-wind-seed", type=int, default=None,
+                           help="Evaluation wind seed; independent stream, defaults to the model seed.")
+    bootstrap.add_argument("--wind-speed-min", type=float, default=6.0)
+    bootstrap.add_argument("--wind-speed-max", type=float, default=10.0)
+    bootstrap.add_argument("--wind-direction-half-width", type=float, default=15.0,
+                           help="Random direction knot half-width around --wind-direction, in degrees.")
+    bootstrap.add_argument("--wind-knot-interval", type=float, default=120.0,
+                           help="Seconds between random wind knots, with linear interpolation.")
     bootstrap.add_argument("--dt", type=float, default=4.0)
     bootstrap.add_argument("--video-fps", type=float, default=None,
                            help="Override playback FPS; default is 10 / dt (10x simulation speed).")
@@ -39,17 +54,17 @@ def main():
     from shared_critic_runner import SharedCriticRunner as EnvRunner
     from train.train import setup_device
     from wind_farm_env import WindFarmEnv
+    from wind_profiles import WindProfileConfig
 
     parser = argparse.ArgumentParser(parents=[bootstrap, get_config()], conflict_handler="resolve")
-    parser.set_defaults(env_name="windfarm", experiment_name="two_turbines",
+    parser.set_defaults(env_name="windfarm", experiment_name="square4",
                         num_env_steps=20000, episode_length=200, n_rollout_threads=1,
                         n_eval_rollout_threads=1, gamma=1.0,
                         use_feature_normalization=False, use_valuenorm=False,
                         lr=3.5e-4, critic_lr=3.5e-4,
                         ppo_epoch=10)
     args = parser.parse_args()
-    # Separate actors need no extra agent identity in the local observation.
-    args.num_agents, args.share_policy, args.scenario_name = 2, False, "two_turbines"
+    args.share_policy = False
     if not args.use_centralized_V:
         parser.error("The turbine setup requires a shared centralized critic.")
     if args.use_popart or args.use_valuenorm:
@@ -66,6 +81,27 @@ def main():
         parser.error("gamma must be between 0 and 1.")
     if args.numeric_eval_interval < 1:
         parser.error("numeric-eval-interval must be positive.")
+    args.wind_seed = args.seed if args.wind_seed is None else args.wind_seed
+    args.eval_wind_seed = args.seed if args.eval_wind_seed is None else args.eval_wind_seed
+    try:
+        wind_settings = dict(mode=args.wind_mode, speed_min=args.wind_speed_min,
+                             speed_max=args.wind_speed_max,
+                             direction_half_width=args.wind_direction_half_width,
+                             knot_interval_s=args.wind_knot_interval)
+        train_wind = WindProfileConfig(seed=args.wind_seed, **wind_settings)
+        eval_wind = WindProfileConfig(seed=args.eval_wind_seed, **wind_settings)
+        layout = None if args.layout_file is None else json.loads(args.layout_file.read_text())
+        env = WindFarmEnv(args.episode_length, args.dt, args.wind_speed,
+                          args.wind_direction, layout=layout, wind_config=train_wind, wind_stream=0)
+    except (ValueError, OSError, TypeError) as exc:
+        parser.error(str(exc))
+    args.num_agents = env.num_agents
+    args.scenario_name = "square4" if layout is None else f"farm_{args.num_agents}"
+    args.layout_d = env.layout_d.tolist()
+    args.remaining_time_index = env.remaining_time_index
+    args.total_rated_power_w = env.total_rated_power_w
+    args.training_wind_config = train_wind.to_dict()
+    args.evaluation_wind_config = eval_wind.to_dict()
     recurrent = args.use_recurrent_policy or args.use_naive_recurrent_policy
     if (args.algorithm_name == "rmappo") != recurrent:
         parser.error("Use --algorithm_name rmappo with a recurrent-policy flag, or mappo without one.")
@@ -76,6 +112,7 @@ def main():
 
     torch.manual_seed(args.seed)
     np.random.seed(args.seed)
+    random.seed(args.seed)
     device = setup_device(args)
     # Keep artifacts in the turbine repository, regardless of launch directory.
     run_dir = ROOT / "rl_runs" / "mappo" / args.experiment_name
@@ -90,8 +127,6 @@ def main():
         versions[package] = metadata.version(package)
     (run_dir / "runtime_versions.json").write_text(json.dumps(versions, indent=2))
 
-    env = WindFarmEnv(args.episode_length, integration.dt, integration.wind_speed,
-                      integration.wind_direction)
     env.seed(args.seed)
     envs = DummyVecEnv([lambda: env])
 
@@ -99,18 +134,29 @@ def main():
         from evaluate_wind_farm import evaluate_episode
         # Separate simulator: evaluation must not reset the training environment
         # or invalidate the observations/recurrent states carried in its buffer.
-        evaluation_env = WindFarmEnv(args.episode_length, integration.dt,
-                                     integration.wind_speed, integration.wind_direction)
+        evaluation_env = WindFarmEnv(args.episode_length, args.dt, args.wind_speed,
+                                     args.wind_direction, layout=env.layout_d,
+                                     wind_config=eval_wind, wind_stream=1)
         try:
             evaluation_env.seed(args.seed)
+            # One held-out profile is replayed at every checkpoint and by the
+            # optional baseline/video. Explicit reset does not advance training
+            # wind counters or draw from policy/global RNGs.
+            scenario = evaluation_env.make_scenario(episode_id=0)
+            scenario_path = run_dir / "evaluation_wind_scenario.json"
+            if not scenario_path.exists():
+                scenario_path.write_text(json.dumps(scenario.to_dict(), indent=2))
             # A physically simulated aligned benchmark is optional; individual
             # GAE baseline values are computed analytically without that rollout.
             records = []
             if episode == 0 and args.evaluate_aligned_baseline:
-                records.append({"episode": episode, "policy": "aligned_baseline",
-                                **evaluate_episode(evaluation_env)})
+                kind = "aligned_baseline" if args.wind_mode == "off" else "yaw_tracking_baseline"
+                records.append({"episode": episode, "policy": kind,
+                                **evaluate_episode(evaluation_env, scenario=scenario,
+                                  trajectory_path=run_dir / f"{kind}_steps.csv")})
             records.append({"episode": episode, "policy": "greedy",
-                            **evaluate_episode(evaluation_env, policies)})
+                            **evaluate_episode(evaluation_env, policies, scenario=scenario,
+                              trajectory_path=run_dir / f"evaluation_episode{episode}_steps.csv")})
             path = run_dir / "evaluation_metrics.csv"
             new_file = not path.exists()
             with path.open("a", newline="", encoding="utf-8") as stream:
@@ -125,7 +171,7 @@ def main():
                 from wind_farm_video import record_policy_video
                 video = record_policy_video(evaluation_env, policies,
                                             run_dir / f"wind_farm_episode{episode}.mp4",
-                                            args.video_fps, episode=episode)
+                                            args.video_fps, episode=episode, scenario=scenario)
                 print(f"Evaluation video: {video}", flush=True)
         finally:
             evaluation_env.close()
@@ -133,7 +179,7 @@ def main():
     runner = None
     try:
         runner = EnvRunner({"all_args": args, "envs": envs, "eval_envs": None,
-                            "num_agents": 2, "device": device, "run_dir": run_dir,
+                            "num_agents": env.num_agents, "device": device, "run_dir": run_dir,
                             "episode_callback": record_evaluation})
         runner.run()
         from plot_training_energy import plot_training_energy
