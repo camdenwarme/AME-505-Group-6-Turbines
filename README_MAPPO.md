@@ -217,9 +217,11 @@ TensorBoard logs, N actor checkpoints (`actor_agent{i}.pt`), N individual critic
 checkpoints (`individual_critic_agent{i}.pt`), and one farm `critic.pt`.
 The default square creates four actors and four individual value critics.
 `--model_dir <models-folder>` loads the current checkpoint format
-for further training; optimizer state is not restored. The minimal launcher uses
-one training environment plus a separate evaluation environment; process isolation
-is required for future concurrent OFF workers.
+for further training; optimizer state is not restored. The launcher uses
+one training environment per episode in a PPO update (`--episodes-per-update`,
+default 1), stepped one after another in a single process, plus a separate
+evaluation environment. Process isolation is still required for future
+*concurrent* OFF workers (see `CHANGELOG.md`).
 Evaluate learned policies against aligned operation with identical initial states
 and episode durations before claiming an energy improvement.
 

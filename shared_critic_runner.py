@@ -242,8 +242,9 @@ class SharedCriticRunner(SeparatedRunner):
         super().run()
 
     def _central_observations(self):
-        # This integration uses DummyVecEnv and one sequential simulator.  Read
-        # the full critic-only snapshot, not just concatenated actor inputs.
+        # This integration uses DummyVecEnv with one simulator per collected
+        # episode, stepped sequentially (--episodes-per-update). Read the full
+        # critic-only snapshot, not just concatenated actor inputs.
         return np.asarray([env.get_centralized_obs() for env in self.envs.envs], dtype=np.float32)
 
     def _individual_references(self):
@@ -277,9 +278,12 @@ class SharedCriticRunner(SeparatedRunner):
         key = (scenario["scenario_id"], environment_index, event)
         if key in self._scenario_events:
             return
+        # Multi-episode batches: _completed_episodes counts environment episodes,
+        # and environment e runs episode completed + e + 1 of the current update.
         record = {"event": event, "environment_index": environment_index,
-                  "training_episode": (self._completed_episodes + 1 if training_episode is None
-                                       else training_episode), "scenario": scenario}
+                  "training_episode": (self._completed_episodes + environment_index + 1
+                                       if training_episode is None else training_episode),
+                  "scenario": scenario}
         with self.scenarios_path.open("a", encoding="utf-8") as stream:
             stream.write(json.dumps(record, allow_nan=False) + "\n")
         self._scenario_events.add(key)
@@ -311,8 +315,10 @@ class SharedCriticRunner(SeparatedRunner):
                 self._register_scenario(env_infos[0]["wind_scenario"], env_index, "completed")
                 env = self.envs.envs[env_index]
                 if getattr(env, "wind_scenario", None) is not None:
+                    # The auto-reset episode belongs to the next update.
                     self._register_scenario(env.wind_scenario.to_dict(), env_index, "reset",
-                                            training_episode=self._completed_episodes + 2)
+                                            training_episode=(self._completed_episodes + self.n_rollout_threads
+                                                              + env_index + 1))
             for i, info in enumerate(env_infos):
                 self._rollout_physical[step, env_index, i] = (
                     info.get("yaw_rate_deg_s", np.nan), info.get("turbine_power_w", np.nan))
@@ -330,9 +336,12 @@ class SharedCriticRunner(SeparatedRunner):
     def _append_episode_metrics(self, infos):
         if self._episode_energy_j is None:
             raise RuntimeError("No episode energy was captured from environment info.")
-        self._cumulative_energy_j += self._episode_energy_j
+        # Multi-episode batches: one row per update. Episode energy/returns are
+        # means over the update's episodes; the cumulative total adds all of them.
+        # "episode" counts environment episodes, so rows land on 2, 4, ... for E = 2.
+        self._cumulative_energy_j += self._episode_energy_j * self.n_rollout_threads
         row = {"episode": self._completed_episodes,
-               "environment_steps": self._completed_episodes * self.episode_length * self.n_rollout_threads,
+               "environment_steps": self._completed_episodes * self.episode_length,
                "elapsed_seconds": time.perf_counter() - self._started_at,
                "critic_value_loss": self._critic_info["value_loss"],
                "critic_return_rmse": self._critic_info["return_rmse"],
@@ -394,7 +403,8 @@ class SharedCriticRunner(SeparatedRunner):
             for step in range(self.episode_length):
                 for env_index, env in enumerate(self.envs.envs):
                     dt = getattr(env, "dt", np.nan)
-                    row = {"episode": self._completed_episodes + 1, "tick": step,
+                    # One episode number per environment, so (episode, tick) stays unique.
+                    row = {"episode": self._completed_episodes + env_index + 1, "tick": step,
                            "environment_index": env_index, "time_start_s": step * dt,
                            "time_end_s": (step + 1) * dt,
                            "farm_power_w": self._rollout_farm_power[step, env_index],
@@ -555,10 +565,17 @@ class SharedCriticRunner(SeparatedRunner):
             info.pop("critic_grad_norm")
             buffer.after_update()
         self.individual_reference[0] = self.individual_reference[-1].copy()
-        self._completed_episodes += 1
+        # Multi-episode batches: each update completes n_rollout_threads episodes.
+        # Evaluate whenever a multiple of the interval is reached or passed, and
+        # after the final update. With one episode per update this is unchanged.
+        previous_episodes = self._completed_episodes
+        self._completed_episodes += self.n_rollout_threads
         self._append_episode_metrics(infos)
-        total_episodes = int(self.num_env_steps) // self.episode_length // self.n_rollout_threads
-        if self._completed_episodes % self.numeric_eval_interval == 0 or self._completed_episodes == total_episodes:
+        total_updates = int(self.num_env_steps) // self.episode_length // self.n_rollout_threads
+        total_episodes = total_updates * self.n_rollout_threads
+        crossed = (self._completed_episodes // self.numeric_eval_interval
+                   > previous_episodes // self.numeric_eval_interval)
+        if crossed or self._completed_episodes == total_episodes:
             self._evaluate_episode(self._completed_episodes)
         return infos
 
@@ -581,8 +598,11 @@ class SharedCriticRunner(SeparatedRunner):
             "team_value": "discounted_remaining_horizon_times_per_step_value",
         }
 
-    def save(self):
-        directory = Path(self.save_dir)
+    def save(self, directory=None):
+        # Default: the rolling checkpoint light_mappo overwrites every episode.
+        # train_mappo.py also passes models_best/ after a new best evaluation.
+        directory = Path(self.save_dir if directory is None else directory)
+        directory.mkdir(parents=True, exist_ok=True)
         (directory / "checkpoint_metadata.json").write_text(json.dumps(self._checkpoint_metadata(), indent=2))
         for i, policy in enumerate(self.policy):
             torch.save(policy.actor.state_dict(), directory / f"actor_agent{i}.pt")

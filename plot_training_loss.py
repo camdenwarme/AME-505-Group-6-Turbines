@@ -10,6 +10,8 @@ from matplotlib.figure import Figure
 from matplotlib.ticker import MaxNLocator
 import numpy as np
 
+from plot_style import FARM_COLOR, turbine_color
+
 
 def plot_training_loss(metrics_path):
     metrics_path = Path(metrics_path)
@@ -25,9 +27,9 @@ def plot_training_loss(metrics_path):
     if not actor_columns:
         raise ValueError("No actor policy-loss columns are recorded.")
     panels = [(key, f"Turbine {int(key.split('_')[0][5:]) + 1} actor", "PPO policy loss",
-               ("#1768ac", "#b76a12", "#8054a8", "#b34e4e")[i % 4])
-              for i, key in enumerate(actor_columns)]
-    panels.append(("critic_value_loss", "Shared centralized critic", "Value loss", "#16806a"))
+               turbine_color(int(key.split('_')[0][5:])))
+              for key in actor_columns]
+    panels.append(("critic_value_loss", "Shared centralized critic", "Value loss", FARM_COLOR))
     figure = Figure(figsize=(10, 2.6 * len(panels)), dpi=160, layout="constrained")
     FigureCanvasAgg(figure)
     axes = figure.subplots(len(panels), 1, sharex=True)

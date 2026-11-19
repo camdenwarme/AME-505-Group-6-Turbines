@@ -35,12 +35,19 @@ def main():
                            help="Override playback FPS; default is 10 / dt (10x simulation speed).")
     bootstrap.add_argument("--no-video", action="store_true",
                            help="Run numeric evaluations without rendering videos.")
+    bootstrap.add_argument("--final-video", action="store_true",
+                           help="Skip videos during training; after training, render the final policy "
+                                "and the best greedy policy (models_best) once each.")
     bootstrap.add_argument("--evaluate-aligned-baseline", action="store_true",
                            help="Also simulate an aligned reference during evaluation.")
     bootstrap.add_argument("--numeric-eval-interval", type=int, default=10,
                            help="Evaluate the greedy policy after this many completed episodes.")
     bootstrap.add_argument("--team-reward-weight", type=float, default=0.5,
                            help="Weight of the farm advantage in each actor update, from 0 to 1.")
+    # Multi-episode batches (CHANGELOG.md, 2026-11-15). Default 1 = original behaviour.
+    bootstrap.add_argument("--episodes-per-update", type=int, default=1,
+                           help="Complete training episodes per PPO update. Each runs in its own "
+                                "simulator, stepped one after another in this process. 1 = original behaviour.")
     integration, _ = bootstrap.parse_known_args()
     mappo = integration.mappo_path.resolve()
     if not (mappo / "config.py").is_file():
@@ -81,6 +88,19 @@ def main():
         parser.error("gamma must be between 0 and 1.")
     if args.numeric_eval_interval < 1:
         parser.error("numeric-eval-interval must be positive.")
+    # Multi-episode batches: light_mappo already stores one buffer column per
+    # rollout environment, so E episodes per update = E sequential environments.
+    # --n_rollout_threads stays rejected above; this flag is the only way in.
+    if args.episodes_per_update < 1:
+        parser.error("episodes-per-update must be at least 1.")
+    if args.episodes_per_update > 1:
+        if args.num_env_steps % (args.episode_length * args.episodes_per_update):
+            parser.error("With --episodes-per-update E, num_env_steps must be a multiple of "
+                         "episode_length * E, so no collected episodes are dropped.")
+        if args.numeric_eval_interval % args.episodes_per_update:
+            parser.error("With --episodes-per-update E, numeric-eval-interval must be a multiple of E "
+                         "(updates happen only every E episodes).")
+    args.n_rollout_threads = args.episodes_per_update
     args.wind_seed = args.seed if args.wind_seed is None else args.wind_seed
     args.eval_wind_seed = args.seed if args.eval_wind_seed is None else args.eval_wind_seed
     try:
@@ -91,8 +111,13 @@ def main():
         train_wind = WindProfileConfig(seed=args.wind_seed, **wind_settings)
         eval_wind = WindProfileConfig(seed=args.eval_wind_seed, **wind_settings)
         layout = None if args.layout_file is None else json.loads(args.layout_file.read_text())
-        env = WindFarmEnv(args.episode_length, args.dt, args.wind_speed,
-                          args.wind_direction, layout=layout, wind_config=train_wind, wind_stream=0)
+        # Multi-episode batches: environment_id gives each training simulator its
+        # own seeded wind stream; environment 0 is the original single environment.
+        train_envs = [WindFarmEnv(args.episode_length, args.dt, args.wind_speed,
+                                  args.wind_direction, layout=layout, wind_config=train_wind,
+                                  wind_stream=0, environment_id=index)
+                      for index in range(args.episodes_per_update)]
+        env = train_envs[0]
     except (ValueError, OSError, TypeError) as exc:
         parser.error(str(exc))
     args.num_agents = env.num_agents
@@ -127,16 +152,47 @@ def main():
         versions[package] = metadata.version(package)
     (run_dir / "runtime_versions.json").write_text(json.dumps(versions, indent=2))
 
-    env.seed(args.seed)
-    envs = DummyVecEnv([lambda: env])
+    for index, train_env in enumerate(train_envs):
+        # Seeds only the (unused) gym action-space samplers; environment 0 keeps the old seed.
+        train_env.seed(args.seed + index * train_env.num_agents)
+    # Default arguments bind each environment now, not the loop's last value.
+    envs = DummyVecEnv([lambda train_env=train_env: train_env for train_env in train_envs])
+    # models/ is overwritten every episode. Keep a separate copy of the policy
+    # with the highest greedy-evaluation farm energy seen so far.
+    best_evaluation = {"episode": None, "farm_energy_mwh": float("-inf")}
+    evaluation_videos = not (args.no_video or args.final_video)
+
+    def make_evaluation_env():
+        return WindFarmEnv(args.episode_length, args.dt, args.wind_speed,
+                           args.wind_direction, layout=env.layout_d,
+                           wind_config=eval_wind, wind_stream=1)
+
+    def refresh_charts():
+        """Rebuild every chart and the HTML report from the CSVs written so far.
+
+        A plotting failure is reported but never stops training.
+        """
+        from plot_training_energy import plot_training_energy
+        from plot_training_loss import plot_training_loss
+        from plot_rewards import plot_reward_summary
+        from plot_training_diagnostics import make_diagnostics
+        from plot_evaluation_turbines import plot_evaluation_turbines
+        from training_report import write_training_report
+        steps = ((plot_training_energy, run_dir / "training_metrics.csv"),
+                 (plot_training_loss, run_dir / "training_metrics.csv"),
+                 (plot_reward_summary, run_dir), (make_diagnostics, run_dir),
+                 (plot_evaluation_turbines, run_dir), (write_training_report, run_dir))
+        for function, argument in steps:
+            try:
+                function(argument)
+            except Exception as error:  # noqa: BLE001 -- charts must not end a long run
+                print(f"Chart refresh skipped {function.__name__}: {error}", flush=True)
 
     def record_evaluation(episode, policies):
         from evaluate_wind_farm import evaluate_episode
         # Separate simulator: evaluation must not reset the training environment
         # or invalidate the observations/recurrent states carried in its buffer.
-        evaluation_env = WindFarmEnv(args.episode_length, args.dt, args.wind_speed,
-                                     args.wind_direction, layout=env.layout_d,
-                                     wind_config=eval_wind, wind_stream=1)
+        evaluation_env = make_evaluation_env()
         try:
             evaluation_env.seed(args.seed)
             # One held-out profile is replayed at every checkpoint and by the
@@ -167,7 +223,17 @@ def main():
             for record in records:
                 print(f"Evaluation episode {episode} {record['policy']}: "
                       f"{record['farm_energy_mwh']:.6f} MWh", flush=True)
-            if not args.no_video:
+            greedy_energy = float(records[-1]["farm_energy_mwh"])
+            if runner is not None and greedy_energy > best_evaluation["farm_energy_mwh"]:
+                best_evaluation.update(episode=episode, farm_energy_mwh=greedy_energy)
+                best_dir = run_dir / "models_best"
+                runner.save(best_dir)
+                (best_dir / "best_evaluation.json").write_text(json.dumps(best_evaluation, indent=2))
+                print(f"New best greedy policy (episode {episode}, {greedy_energy:.6f} MWh) "
+                      f"saved to {best_dir}", flush=True)
+            if episode > 0:
+                refresh_charts()
+            if evaluation_videos:
                 from wind_farm_video import record_policy_video
                 video = record_policy_video(evaluation_env, policies,
                                             run_dir / f"wind_farm_episode{episode}.mp4",
@@ -182,6 +248,28 @@ def main():
                             "num_agents": env.num_agents, "device": device, "run_dir": run_dir,
                             "episode_callback": record_evaluation})
         runner.run()
+        if args.final_video:
+            from wind_farm_video import record_policy_video
+            final_episode = runner._completed_episodes
+            # Final policy first: loading the best weights afterwards replaces it.
+            videos = [("final", final_episode, None)]
+            if best_evaluation["episode"] not in (None, final_episode):
+                videos.append(("best", best_evaluation["episode"], run_dir / "models_best"))
+            for label, episode, weights in videos:
+                if weights is not None:
+                    for i, policy in enumerate(runner.policy):
+                        policy.actor.load_state_dict(torch.load(
+                            weights / f"actor_agent{i}.pt", map_location=device, weights_only=True))
+                video_env = make_evaluation_env()
+                try:
+                    video_env.seed(args.seed)
+                    video = record_policy_video(video_env, runner.policy,
+                                                run_dir / f"wind_farm_{label}_episode{episode}.mp4",
+                                                args.video_fps, episode=episode,
+                                                scenario=video_env.make_scenario(episode_id=0))
+                    print(f"{label.capitalize()} policy video: {video}", flush=True)
+                finally:
+                    video_env.close()
         from plot_training_energy import plot_training_energy
         print(f"Training energy plot: {plot_training_energy(runner.metrics_path)}", flush=True)
         from plot_training_loss import plot_training_loss
@@ -191,9 +279,11 @@ def main():
         from plot_training_diagnostics import make_diagnostics
         diagnostics_plot, diagnostics_summary = make_diagnostics(run_dir)
         print(f"Training diagnostics: {diagnostics_plot} and {diagnostics_summary}", flush=True)
+        from plot_evaluation_turbines import plot_evaluation_turbines
+        print(f"Per-turbine evaluation plot: {plot_evaluation_turbines(run_dir)}", flush=True)
         from training_report import write_training_report, write_evaluation_state_report
         print(f"Training plots report: {write_training_report(run_dir)}", flush=True)
-        if not args.no_video:
+        if not args.no_video or args.final_video:
             print(f"Evaluation report: {write_evaluation_state_report(run_dir)}", flush=True)
     finally:
         envs.close()

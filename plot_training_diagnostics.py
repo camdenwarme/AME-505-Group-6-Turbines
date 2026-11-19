@@ -11,6 +11,7 @@ from matplotlib.backends.backend_agg import FigureCanvasAgg
 from matplotlib.figure import Figure
 from matplotlib.ticker import MaxNLocator
 from plot_rewards import evaluation_baseline_label
+from plot_style import FARM_COLOR, TURBINE_COLORS
 
 
 def _rows(path):
@@ -90,8 +91,8 @@ def make_diagnostics(run_dir, output_dir=None):
     agent_ids = list(range(int(config["num_agents"]))) if "num_agents" in config else sorted(found)
     if not agent_ids:  # Preserve empty legacy-report behavior without assuming new runs are two-agent.
         agent_ids = [0, 1]
-    colors = ("#b76a12", "#16806a", "#8054a8", "#b34e4e", "#527491", "#778b42")
-    rmse = [("Farm critic", "#1768ac", _series(training, "critic_return_rmse"))]
+    colors = TURBINE_COLORS
+    rmse = [("Farm critic", FARM_COLOR, _series(training, "critic_return_rmse"))]
     rmse.extend((f"Turbine {i + 1} critic", colors[j % len(colors)],
                  _series(training, f"actor{i}_individual_value_rmse")) for j, i in enumerate(agent_ids))
     clips = [(f"Turbine {i + 1} actor", colors[j % len(colors)],

@@ -9,6 +9,7 @@ from unittest.mock import patch
 from matplotlib.figure import Figure
 import numpy as np
 
+from plot_evaluation_turbines import plot_evaluation_turbines
 from plot_rewards import plot_reward_summary
 from plot_training_energy import plot_training_energy
 
@@ -81,6 +82,39 @@ class PlotSummaryTests(unittest.TestCase):
             self.assertEqual(energy["lines"]["Evaluation (greedy policy)"], ([0], [9.0]))
             self.assertEqual(reward["lines"]["Evaluation (greedy policy)"], ([0], [90.0]))
             self.assertNotIn("Aligned baseline", energy["lines"])
+
+    def test_evaluation_turbines_uses_baseline_and_mean_yaw(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            fields = ["episode", "policy", "farm_energy_mwh", "turbine0_energy_mwh", "turbine1_energy_mwh"]
+            _write_csv(root / "evaluation_metrics.csv", fields, [
+                dict(episode=0, policy="aligned_baseline", farm_energy_mwh=1.2,
+                     turbine0_energy_mwh=1.0, turbine1_energy_mwh=0.2),
+                dict(episode=0, policy="greedy", farm_energy_mwh=1.2,
+                     turbine0_energy_mwh=1.0, turbine1_energy_mwh=0.2),
+                dict(episode=10, policy="greedy", farm_energy_mwh=1.3,
+                     turbine0_energy_mwh=0.95, turbine1_energy_mwh=0.35),
+            ])
+            for episode, yaw in ((0, 0.0), (10, 15.0)):
+                _write_csv(root / f"evaluation_episode{episode}_steps.csv",
+                           ["tick", "turbine0_yaw_deg", "turbine1_yaw_deg"],
+                           [dict(tick=t, turbine0_yaw_deg=yaw, turbine1_yaw_deg=-1.0) for t in range(3)])
+            captured = {}
+
+            def savefig(figure, *_args, **_kwargs):
+                captured["axes"] = [{line.get_label(): list(line.get_ydata()) for line in axis.get_lines()}
+                                    for axis in figure.axes]
+
+            with patch.object(Figure, "savefig", savefig):
+                plot_evaluation_turbines(root)
+            energy, delta, yaw = captured["axes"]
+            np.testing.assert_allclose(energy["Greedy policy (farm total)"], [1.2, 1.3])
+            self.assertIn("Aligned baseline", energy)
+            np.testing.assert_allclose(delta["Turbine 1"], [0.0, -0.05], atol=1e-12)
+            np.testing.assert_allclose(delta["Turbine 2"], [0.0, 0.15], atol=1e-12)
+            np.testing.assert_allclose(delta["Farm total"], [0.0, 0.1], atol=1e-12)
+            np.testing.assert_allclose(yaw["Turbine 1"], [0.0, 15.0])
+            np.testing.assert_allclose(yaw["Turbine 2"], [-1.0, -1.0])
 
 
 if __name__ == "__main__":

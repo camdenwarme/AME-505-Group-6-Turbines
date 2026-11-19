@@ -47,6 +47,43 @@ class WindFarmEnvTests(unittest.TestCase):
         finally:
             env.close()
 
+    def test_interleaved_simulators_do_not_interact(self):
+        """--episodes-per-update steps several OFF simulators in turn in one process.
+
+        Simulator A must produce identical results whether it runs alone or
+        interleaved with B, including while B finishes and a fresh B starts.
+        """
+        rates_a = [[[2.0], [-1.0]], [[4.0], [0.0]], [[-3.0], [5.0]]]
+        rates_b = [[[-6.0], [6.0]], [[1.0], [-2.0]]]
+
+        def snapshot(env, obs, rewards):
+            return np.concatenate((obs.ravel(), rewards.ravel(), env.get_centralized_obs()))
+
+        alone = two_env(episode_length=3)
+        try:
+            expected = [alone.reset().ravel()]
+            for rates in rates_a:
+                obs, rewards, _, _ = alone.step(np.array(rates))
+                expected.append(snapshot(alone, obs, rewards))
+        finally:
+            alone.close()
+        first, second = two_env(episode_length=3), two_env(episode_length=2)
+        try:
+            actual = [first.reset().ravel()]
+            second.reset()
+            for tick, rates in enumerate(rates_a):
+                if tick < len(rates_b):
+                    second.step(np.array(rates_b[tick]))
+                obs, rewards, _, _ = first.step(np.array(rates))
+                actual.append(snapshot(first, obs, rewards))
+                if tick == 1:
+                    second.reset()  # B's episode ended; a new simulator starts mid-episode for A
+        finally:
+            first.close()
+            second.close()
+        for want, got in zip(expected, actual):
+            np.testing.assert_array_equal(got, want)
+
     def test_dynamic_wind_has_correct_ticks_and_no_uncommanded_heading_motion(self):
         scenario = WindScenario([0, 4, 8, 12], [8, 9, 10, 8], [359, 361, 363, 365],
                                 mode="both", episode_seed=7)

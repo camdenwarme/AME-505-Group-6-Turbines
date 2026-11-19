@@ -30,6 +30,10 @@ def write_training_report(run_dir):
     if (run_dir / "training_diagnostics.png").exists():
         plots.append('<section><h2>Training diagnostics</h2>' +
                      _plot_image(run_dir / "training_diagnostics.png", "Training diagnostics") + '</section>')
+    if (run_dir / "evaluation_turbines.png").exists():
+        plots.append('<section><h2>Greedy evaluations by turbine</h2>' +
+                     _plot_image(run_dir / "evaluation_turbines.png", "Greedy evaluations by turbine") +
+                     '</section>')
     return _write_report(run_dir, "Wind-farm training plots", "training_plots.html", plots)
 
 

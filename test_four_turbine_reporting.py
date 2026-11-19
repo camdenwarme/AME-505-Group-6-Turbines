@@ -164,6 +164,22 @@ class FourTurbineReportingTests(unittest.TestCase):
                 pilots.append(read_pilot(root))
             self.assertEqual(select(pilots)["selected_weight"], 0.75)
             self.assertIn("turbine3_energy_mwh", pilots[1]["final_greedy"])
+            # --episodes-per-update 2: one metrics row per update, numbered by episode.
+            config_path = Path(pilots[0]["path"]) / "config.json"
+            config = json.loads(config_path.read_text())
+            config.update(num_env_steps=4, n_rollout_threads=2)  # one update of two 2-step episodes
+            config_path.write_text(json.dumps(config))
+            metrics_path = Path(pilots[0]["path"]) / "training_metrics.csv"
+            for episode, error in ((1, "incomplete training"), (2, "initial and final greedy")):
+                with metrics_path.open("w", newline="") as stream:
+                    writer = csv.DictWriter(stream, ["episode", "environment_steps"])
+                    writer.writeheader()
+                    writer.writerow({"episode": episode, "environment_steps": 2 * episode})
+                with self.assertRaisesRegex(ValueError, error):
+                    read_pilot(pilots[0]["path"])  # greedy evaluations are still at episodes 0 and 1
+            evaluation = Path(pilots[0]["path"]) / "evaluation_metrics.csv"
+            evaluation.write_text(evaluation.read_text().replace("\n1,greedy", "\n2,greedy"))
+            self.assertEqual(read_pilot(pilots[0]["path"])["training_episodes"], 2)
             pilots[1]["evaluation_scenario_id"] = "different-wind"
             with self.assertRaisesRegex(ValueError, "different evaluation wind"):
                 select(pilots)

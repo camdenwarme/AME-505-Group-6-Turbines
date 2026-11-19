@@ -33,9 +33,12 @@ def read_pilot(directory):
     if not training:
         raise ValueError(f"{directory}: no completed training episodes")
     episode = int(training[-1]["episode"])
-    expected = int(config["num_env_steps"]) // (int(config["episode_length"]) *
-                                                  int(config["n_rollout_threads"]))
-    if episode != expected or len(training) != expected:
+    # Multi-episode batches: one training row per update, and the "episode"
+    # column counts environment episodes (n_rollout_threads per update).
+    episodes_per_update = int(config["n_rollout_threads"])
+    updates = int(config["num_env_steps"]) // (int(config["episode_length"]) * episodes_per_update)
+    expected = updates * episodes_per_update
+    if episode != expected or len(training) != updates:
         raise ValueError(f"{directory}: incomplete training ({episode}/{expected} episodes)")
     greedy = [row for row in evaluations if row.get("policy") == "greedy"]
     before = [row for row in greedy if int(row["episode"]) == 0]

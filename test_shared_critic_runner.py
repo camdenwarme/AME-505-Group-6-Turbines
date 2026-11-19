@@ -376,6 +376,67 @@ class SharedCriticTests(unittest.TestCase):
                     for key in before:
                         torch.testing.assert_close(before[key], after[key], rtol=0, atol=0)
 
+    def test_multi_episode_updates_number_episodes_and_schedule_evaluations(self):
+        """--episodes-per-update 2: one PPO update per two episodes (CHANGELOG.md)."""
+        torch.set_num_threads(1)
+        # An interval that is not a multiple of E evaluates at the first update past it.
+        for interval, expected_evaluations in ((2, [0, 2, 4, 6]), (3, [0, 4, 6])):
+            with self.subTest(interval=interval), tempfile.TemporaryDirectory() as directory:
+                torch.manual_seed(5)
+                np.random.seed(5)
+                random.seed(5)
+                args = get_config().parse_args([])
+                args.use_valuenorm = False
+                args.use_feature_normalization = False
+                args.episode_length, args.n_rollout_threads = 4, 2
+                args.num_env_steps, args.ppo_epoch, args.num_mini_batch = 24, 2, 1
+                args.numeric_eval_interval = interval
+                args.log_interval = args.save_interval = 100
+                args.scenario_name = "test"
+                evaluated = []
+                envs = DummyVecEnv([_Farm, _Farm])
+                runner = SharedCriticRunner({"all_args": args, "envs": envs, "eval_envs": None,
+                                             "num_agents": 2, "device": torch.device("cpu"),
+                                             "run_dir": Path(directory),
+                                             "episode_callback": lambda episode, _: evaluated.append(episode)})
+                try:
+                    self.assertEqual(runner.buffer[0].rewards.shape, (4, 2, 1))
+                    with patch.object(runner.critic_optimizer, "step",
+                                      wraps=runner.critic_optimizer.step) as critic_step, \
+                         patch.object(envs.envs[0], "step", wraps=envs.envs[0].step) as first, \
+                         patch.object(envs.envs[1], "step", wraps=envs.envs[1].step) as second:
+                        runner.run()
+                    # Three updates, each over both four-step episodes.
+                    self.assertEqual((first.call_count, second.call_count), (12, 12))
+                    self.assertEqual(critic_step.call_count, 3 * args.ppo_epoch * args.num_mini_batch)
+                    self.assertEqual(evaluated, expected_evaluations)
+                    self.assertEqual(runner._completed_episodes, 6)
+                    with runner.metrics_path.open(newline="") as stream:
+                        rows = list(csv.DictReader(stream))
+                    self.assertEqual([int(row["episode"]) for row in rows], [2, 4, 6])
+                    self.assertEqual([int(row["environment_steps"]) for row in rows], [8, 16, 24])
+                    for row in rows:
+                        # Per-episode means, while the cumulative total counts every episode.
+                        self.assertAlmostEqual(float(row["episode_energy_mwh"]), 0.004)
+                        self.assertAlmostEqual(float(row["cumulative_energy_mwh"]),
+                                               int(row["episode"]) * 0.004)
+                        self.assertEqual(float(row["episode_return"]), 2.0)
+                        self.assertAlmostEqual(float(row["actor1_individual_return"]), 3.2, places=6)
+                    with runner.rollout_path.open(newline="") as stream:
+                        steps = list(csv.DictReader(stream))
+                    self.assertEqual(len(steps), 24)
+                    ticks = {}
+                    for row in steps:
+                        ticks.setdefault(int(row["episode"]), []).append(
+                            (int(row["environment_index"]), int(row["tick"])))
+                    self.assertEqual(sorted(ticks), [1, 2, 3, 4, 5, 6])
+                    for episode, keys in ticks.items():
+                        # Each episode number belongs to exactly one environment.
+                        self.assertEqual(sorted(keys), [((episode - 1) % 2, tick) for tick in range(4)])
+                finally:
+                    runner.writter.close()
+                    envs.close()
+
     def test_single_critic_updates_and_checkpoint_roundtrip(self):
         torch.set_num_threads(1)
         for mode in ("feedforward", "recurrent", "naive_recurrent"):
