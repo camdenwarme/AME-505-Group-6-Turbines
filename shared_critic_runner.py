@@ -144,12 +144,23 @@ class SharedCriticRunner(SeparatedRunner):
             install_bounded_action_head(policy, self.envs.action_space[i])
         self._episode_callback = config.get("episode_callback")
         self._completed_episodes = 0
+        self._completed_rounds = 0
         self._episode_energy_j = None
         self._cumulative_energy_j = 0.0
         self._started_at = time.perf_counter()
         self.team_reward_weight = float(getattr(args, "team_reward_weight", 0.5))
         if not 0.0 <= self.team_reward_weight <= 1.0:
             raise ValueError("team_reward_weight must be between 0 and 1.")
+        # Older callers/configurations retain their explicitly fixed weighting.
+        # The training CLI enables exponential decay by default for new runs.
+        self.advantage_weight_schedule = getattr(args, "advantage_weight_schedule", "constant")
+        self.advantage_decay_beta = float(getattr(args, "advantage_decay_beta", 0.05))
+        if self.advantage_weight_schedule not in ("exponential", "constant"):
+            raise ValueError("Unknown advantage weighting schedule.")
+        if not np.isfinite(self.advantage_decay_beta) or not 0 <= self.advantage_decay_beta <= 1:
+            raise ValueError("advantage_decay_beta must be between 0 and 1.")
+        self._constant_team_reward_weight = self.team_reward_weight
+        self._set_advantage_weights()
         self.individual_rewards = np.zeros(
             (self.episode_length, self.n_rollout_threads, self.num_agents, 1), dtype=np.float32)
         self.individual_reference = np.zeros(
@@ -170,6 +181,8 @@ class SharedCriticRunner(SeparatedRunner):
         self.metrics_path = Path(self.run_dir) / "training_metrics.csv"
         self.rollout_path = Path(self.run_dir) / "rollout_steps.csv"
         self._csv_columns = ("episode", "environment_steps", "elapsed_seconds",
+                             "update_round", "environment_index",
+                             "individual_advantage_weight", "farm_advantage_weight",
                              *(f"actor{i}_policy_loss" for i in range(self.num_agents)),
                              *(f"actor{i}_ppo_clip_fraction" for i in range(self.num_agents)),
                              "critic_value_loss", "critic_return_rmse", "critic_explained_variance",
@@ -234,16 +247,52 @@ class SharedCriticRunner(SeparatedRunner):
             np.random.set_state(numpy_state)
             random.setstate(python_state)
 
+    def _set_advantage_weights(self):
+        if self.advantage_weight_schedule == "exponential":
+            self.individual_advantage_weight = (1 - self.advantage_decay_beta) ** self._completed_rounds
+            self.team_reward_weight = 1 - self.individual_advantage_weight
+        else:
+            self.team_reward_weight = self._constant_team_reward_weight
+            self.individual_advantage_weight = 1 - self.team_reward_weight
+
     def run(self):
         self._completed_episodes = 0
+        self._completed_rounds = 0
+        self._set_advantage_weights()
         self._cumulative_energy_j = 0.0
         self._started_at = time.perf_counter()
         self._evaluate_episode(0)
-        super().run()
+        from parallel_env import ProcessVecEnv
+        if not isinstance(self.envs, ProcessVecEnv):
+            return super().run()
+        rounds = int(self.num_env_steps) // self.episode_length // self.n_rollout_threads
+        for round_index in range(rounds):
+            # Workers remain at the preceding terminal state throughout training.
+            # Reset starts the next round only after every optimizer has finished.
+            self.warmup()
+            if self.use_linear_lr_decay:
+                for trainer in self.trainer:
+                    trainer.policy.lr_decay(round_index, rounds)
+            for step in range(self.episode_length):
+                values, actions, log_probs, states, critic_states, actions_env = self.collect(step)
+                obs, rewards, dones, infos = self.envs.step(actions_env)
+                if np.any(dones) != (step == self.episode_length - 1) or (
+                        step == self.episode_length - 1 and not np.all(dones)):
+                    raise RuntimeError("Every worker must complete exactly one full episode per round.")
+                self.insert((obs, rewards, dones, infos, values, actions, log_probs,
+                             states, critic_states))
+            self.compute()
+            train_infos = self.train()
+            total_steps = self._completed_episodes * self.episode_length
+            if round_index % self.save_interval == 0 or round_index == rounds - 1:
+                self.save()
+            if round_index % self.log_interval == 0:
+                self.log_train(train_infos, total_steps)
+            print(f"Round {round_index + 1}/{rounds}: "
+                  f"{self._completed_episodes} episodes completed; policy updated.", flush=True)
 
     def _central_observations(self):
-        # This integration uses DummyVecEnv and one sequential simulator.  Read
-        # the full critic-only snapshot, not just concatenated actor inputs.
+        # Process environments expose cached worker snapshots, without extra RPCs.
         return np.asarray([env.get_centralized_obs() for env in self.envs.envs], dtype=np.float32)
 
     def _individual_references(self):
@@ -278,7 +327,7 @@ class SharedCriticRunner(SeparatedRunner):
         if key in self._scenario_events:
             return
         record = {"event": event, "environment_index": environment_index,
-                  "training_episode": (self._completed_episodes + 1 if training_episode is None
+                  "training_episode": (self._completed_episodes + environment_index + 1 if training_episode is None
                                        else training_episode), "scenario": scenario}
         with self.scenarios_path.open("a", encoding="utf-8") as stream:
             stream.write(json.dumps(record, allow_nan=False) + "\n")
@@ -288,8 +337,8 @@ class SharedCriticRunner(SeparatedRunner):
         # DummyVecEnv resets completed environments before returning. The info
         # snapshot still contains the terminal episode energy before that reset.
         # Count farm energy once, not once per turbine sharing the same reward.
-        self._episode_energy_j = float(np.mean([
-            env_infos[0]["episode_energy_j"] for env_infos in data[3]]))
+        self._episode_energy_j = np.asarray([
+            env_infos[0]["episode_energy_j"] for env_infos in data[3]], dtype=float)
         (obs, rewards, dones, infos, values, actions, log_probs,
          states, critic_states) = data
         # DummyVecEnv has reset completed environments, so central observations
@@ -310,9 +359,10 @@ class SharedCriticRunner(SeparatedRunner):
             if "wind_scenario" in env_infos[0]:
                 self._register_scenario(env_infos[0]["wind_scenario"], env_index, "completed")
                 env = self.envs.envs[env_index]
-                if getattr(env, "wind_scenario", None) is not None:
+                if (getattr(env, "wind_scenario", None) is not None and
+                        env.wind_scenario.to_dict()["scenario_id"] != env_infos[0]["wind_scenario"]["scenario_id"]):
                     self._register_scenario(env.wind_scenario.to_dict(), env_index, "reset",
-                                            training_episode=self._completed_episodes + 2)
+                                            training_episode=self._completed_episodes + self.n_rollout_threads + env_index + 1)
             for i, info in enumerate(env_infos):
                 self._rollout_physical[step, env_index, i] = (
                     info.get("yaw_rate_deg_s", np.nan), info.get("turbine_power_w", np.nan))
@@ -330,34 +380,40 @@ class SharedCriticRunner(SeparatedRunner):
     def _append_episode_metrics(self, infos):
         if self._episode_energy_j is None:
             raise RuntimeError("No episode energy was captured from environment info.")
-        self._cumulative_energy_j += self._episode_energy_j
-        row = {"episode": self._completed_episodes,
-               "environment_steps": self._completed_episodes * self.episode_length * self.n_rollout_threads,
-               "elapsed_seconds": time.perf_counter() - self._started_at,
-               "critic_value_loss": self._critic_info["value_loss"],
-               "critic_return_rmse": self._critic_info["return_rmse"],
-               "critic_explained_variance": self._critic_info["explained_variance"],
-               "episode_energy_j": self._episode_energy_j,
-               "episode_energy_mwh": self._episode_energy_j / 3.6e9,
-               "cumulative_energy_j": self._cumulative_energy_j,
-               "cumulative_energy_mwh": self._cumulative_energy_j / 3.6e9,
-               # Shared team reward: count one turbine, not both copies.
-               "episode_return": float(self.buffer[0].rewards.sum(axis=0).mean()),
-               "episode_end_reward": float(self.buffer[0].rewards[-1].mean())}
-        for key in ("scenario_id", "episode_seed", "wind_mode"):
-            row[key] = self._episode_conditions.get(key, "")
-        for key in ("ambient_wind_speed_m_s", "ambient_wind_direction_deg"):
-            row["end_" + key] = self._episode_conditions.get(key, "")
-        for i, info in enumerate(infos):
-            row[f"actor{i}_policy_loss"] = float(info["policy_loss"])
-            row[f"actor{i}_ppo_clip_fraction"] = float(info["ppo_clip_fraction"])
-            row[f"actor{i}_individual_return"] = float(self.individual_rewards[:, :, i].sum(axis=0).mean())
-            row[f"actor{i}_individual_value_loss"] = self._individual_value_info[i]["loss"]
-            row[f"actor{i}_individual_value_rmse"] = self._individual_value_info[i]["rmse"]
-        # Close after each row so progress is immediately readable, including
-        # while a subsequent evaluation/video is running or if a run stops early.
+        rows = []
+        first_episode = self._completed_episodes - self.n_rollout_threads + 1
+        for env_index, energy in enumerate(np.atleast_1d(self._episode_energy_j)):
+            self._cumulative_energy_j += energy
+            episode = first_episode + env_index
+            row = {"episode": episode,
+                   "update_round": self._completed_rounds, "environment_index": env_index,
+                   "individual_advantage_weight": self.individual_advantage_weight,
+                   "farm_advantage_weight": self.team_reward_weight,
+                   "environment_steps": episode * self.episode_length,
+                   "elapsed_seconds": time.perf_counter() - self._started_at,
+                   "critic_value_loss": self._critic_info["value_loss"],
+                   "critic_return_rmse": self._critic_info["return_rmse"],
+                   "critic_explained_variance": self._critic_info["explained_variance"],
+                   "episode_energy_j": energy, "episode_energy_mwh": energy / 3.6e9,
+                   "cumulative_energy_j": self._cumulative_energy_j,
+                   "cumulative_energy_mwh": self._cumulative_energy_j / 3.6e9,
+                   "episode_return": float(self.buffer[0].rewards[:, env_index].sum()),
+                   "episode_end_reward": float(self.buffer[0].rewards[-1, env_index, 0])}
+            conditions = self._rollout_conditions[-1][env_index]
+            for key in ("scenario_id", "episode_seed", "wind_mode"):
+                row[key] = conditions.get(key, "")
+            for key in ("ambient_wind_speed_m_s", "ambient_wind_direction_deg"):
+                row["end_" + key] = conditions.get(key, "")
+            # Losses describe the joint update; rewards and energy describe this episode.
+            for i, info in enumerate(infos):
+                row[f"actor{i}_policy_loss"] = float(info["policy_loss"])
+                row[f"actor{i}_ppo_clip_fraction"] = float(info["ppo_clip_fraction"])
+                row[f"actor{i}_individual_return"] = float(self.individual_rewards[:, env_index, i].sum())
+                row[f"actor{i}_individual_value_loss"] = self._individual_value_info[i]["loss"]
+                row[f"actor{i}_individual_value_rmse"] = self._individual_value_info[i]["rmse"]
+            rows.append(row)
         with self.metrics_path.open("a", newline="", encoding="utf-8") as stream:
-            csv.DictWriter(stream, fieldnames=self._csv_columns).writerow(row)
+            csv.DictWriter(stream, fieldnames=self._csv_columns).writerows(rows)
         self._episode_energy_j = None
 
     def _critic_samples(self, buffer):
@@ -376,6 +432,7 @@ class SharedCriticRunner(SeparatedRunner):
         # Observations/actions in buffers are at interval start; power and
         # applied rates from info belong to the corresponding interval end.
         fields = ["episode", "tick", "environment_index", "time_start_s", "time_end_s",
+                  "update_round", "individual_advantage_weight", "farm_advantage_weight",
                   "scenario_id", "episode_seed", "wind_mode", "ambient_wind_speed_m_s",
                   "ambient_wind_direction_deg",
                   "farm_power_w", "team_reward", "team_value", "team_return_to_go",
@@ -394,7 +451,10 @@ class SharedCriticRunner(SeparatedRunner):
             for step in range(self.episode_length):
                 for env_index, env in enumerate(self.envs.envs):
                     dt = getattr(env, "dt", np.nan)
-                    row = {"episode": self._completed_episodes + 1, "tick": step,
+                    row = {"episode": self._completed_episodes + env_index + 1, "tick": step,
+                           "update_round": self._completed_rounds + 1,
+                           "individual_advantage_weight": self.individual_advantage_weight,
+                           "farm_advantage_weight": self.team_reward_weight,
                            "environment_index": env_index, "time_start_s": step * dt,
                            "time_end_s": (step + 1) * dt,
                            "farm_power_w": self._rollout_farm_power[step, env_index],
@@ -491,7 +551,7 @@ class SharedCriticRunner(SeparatedRunner):
             if i == 0:
                 team_values = baseline.copy()
                 team_advantage_snapshot = team_advantage.copy()
-            mixed = ((1 - self.team_reward_weight) * standardize(individual_advantage) +
+            mixed = (self.individual_advantage_weight * standardize(individual_advantage) +
                      self.team_reward_weight * standardize(team_advantage))
             # Reuse light_mappo's sequence/minibatch handling and actor update.
             # Its train() subtracts baseline and normalizes once more; restore
@@ -555,10 +615,16 @@ class SharedCriticRunner(SeparatedRunner):
             info.pop("critic_grad_norm")
             buffer.after_update()
         self.individual_reference[0] = self.individual_reference[-1].copy()
-        self._completed_episodes += 1
+        self._completed_episodes += self.n_rollout_threads
+        self._completed_rounds += 1
         self._append_episode_metrics(infos)
-        total_episodes = int(self.num_env_steps) // self.episode_length // self.n_rollout_threads
-        if self._completed_episodes % self.numeric_eval_interval == 0 or self._completed_episodes == total_episodes:
+        # One decay step per complete collection/update round, never per worker,
+        # agent, minibatch or PPO epoch. Both critics still train at all weights.
+        self._set_advantage_weights()
+        total_episodes = int(self.num_env_steps) // self.episode_length
+        previous = self._completed_episodes - self.n_rollout_threads
+        if (self._completed_episodes // self.numeric_eval_interval > previous // self.numeric_eval_interval
+                or self._completed_episodes == total_episodes):
             self._evaluate_episode(self._completed_episodes)
         return infos
 

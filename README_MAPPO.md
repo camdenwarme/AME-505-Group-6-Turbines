@@ -1,5 +1,67 @@
 # Wind-farm MAPPO: four-turbine square and seeded wind
 
+## Exponential advantage weighting
+
+New training runs default to `--advantage-weight-schedule exponential` with
+`--advantage-decay-beta 0.05`. For zero-based round index r (the number of fully
+completed collection/update rounds), the individual weight is `(1-beta)**r`
+and the farm weight is `1-(1-beta)**r`. Both separately standardized advantages
+are mixed using these weights. Both individual and farm critics continue training
+even when their advantage has zero actor weight.
+
+With two workers and beta 0.05, episodes 1-2 use 1.0/0.0, episodes 3-4 use 0.95/0.05,
+and episodes 5-6 use 0.9025/0.0975 (individual/farm). The weights remain fixed across
+all workers, actors, minibatches and PPO epochs in a round. Decay advances once
+after that round's complete update. Beta must be finite and in [0,1]: zero keeps
+the individual weight at one; one switches fully to farm after the first round.
+
+```powershell
+python train_mappo.py --episode-workers 2 --num_env_steps 10000 --ppo_epoch 1 --advantage-decay-beta 0.05 --no-video
+```
+
+To retain fixed 50/50 weighting, use
+`--advantage-weight-schedule constant --team-reward-weight 0.5`.
+`--team-reward-weight` applies only in constant mode. Saved `config.json` records
+the schedule and beta; `training_metrics.csv` and `rollout_steps.csv` record the
+individual and farm weights actually used in each round. The change applies to
+new training processes; an already-running process retains its loaded behavior.
+Loading actor/critic checkpoints starts a fresh training schedule at round zero,
+just as the existing launcher starts fresh optimizers and episode counters.
+
+## Parallel episodes with synchronized training
+
+```powershell
+python train_mappo.py --episode-workers 5 --episode_length 200 --num_env_steps 20000 --ppo_epoch 1 --no-video
+```
+
+This runs 100 total training episodes as 20 rounds of five episodes. Each episode
+has its own spawned simulator process. Actors remain in the parent process and
+generate actions for all workers using the same frozen policy. All simulators
+receive their actions before the parent waits for their results. After every
+worker completes its episode, the parent trains on all five trajectories. Workers
+remain idle at their terminal states until training finishes, then reset together
+for the next round. Simulator processes persist across rounds.
+
+`--episode-workers` is an alias for `--n_rollout_threads`; it defaults to one.
+`--ppo_epoch` independently controls the training passes over each round's data.
+For example, `--ppo_epoch 10` uses the same collection barriers, followed by ten
+training passes. Minibatching can produce multiple optimizer steps within a pass.
+`--num_env_steps` counts transitions across all workers and must be divisible by
+`episode_length * episode-workers`; incomplete rounds are rejected rather than
+silently discarded. Evaluation occurs after completed rounds when an episode
+interval is crossed, plus before training and after the final round.
+
+`--threads-per-worker` defaults to one to avoid nested numerical-library thread
+pools. Windows schedules the separate processes across available CPU cores;
+workers are not pinned to fixed physical cores. Increasing the worker count
+increases memory use. Each worker has an independent reproducible wind stream
+identified by its environment index. Policies are updated only in the parent.
+
+`training_metrics.csv` contains one row per individual episode, with
+`update_round` and `environment_index`. Losses describe the shared round update;
+energy and rewards describe that specific episode. `rollout_steps.csv` and wind
+scenario records preserve distinct episode identifiers across workers.
+
 See [README_FOUR_TURBINES_DYNAMIC_WIND.md](README_FOUR_TURBINES_DYNAMIC_WIND.md)
 for the structured change record, implementation locations, design decisions,
 verification, and information-preservation details for this update.
@@ -127,7 +189,8 @@ At the end of each episode, the runner computes each actor's individual GAE
 advantage using its own normalized energy reward and its reference-plus-residual
 value, alongside the farm's GAE advantage using the farm critic. It standardizes those
 components separately and mixes them as `(1 - w) * individual + w * team`,
-where `w = --team-reward-weight` defaults to `0.5` and is constrained to [0, 1].
+where `w` follows the exponential schedule above by default. In constant mode,
+`w = --team-reward-weight` defaults to `0.5` and is constrained to [0, 1].
 The combined advantage is normalized again by the MAPPO trainer. A weight of
 zero removes the team advantage from actor updates; one removes the individual
 signal. The critic is trained on the farm target, not an individual target.
@@ -151,8 +214,8 @@ consumes the complete loop for existing scripts. Wake history persists between
 actions, and action/reward timing follows FDynSim's existing convention.
 
 The launcher defaults to actor and critic learning rates of `0.00035` and
-10 PPO epochs per rollout. This medium update size is a starting point, not a
-proven optimum. Override it with `--lr`, `--critic_lr`, and `--ppo_epoch`.
+1 PPO epoch per rollout, so each episode's data is used for one training pass.
+Override these settings with `--lr`, `--critic_lr`, and `--ppo_epoch`.
 
 ```powershell
 # Short integration check (not enough training to learn useful control)
@@ -217,9 +280,8 @@ TensorBoard logs, N actor checkpoints (`actor_agent{i}.pt`), N individual critic
 checkpoints (`individual_critic_agent{i}.pt`), and one farm `critic.pt`.
 The default square creates four actors and four individual value critics.
 `--model_dir <models-folder>` loads the current checkpoint format
-for further training; optimizer state is not restored. The minimal launcher uses
-one training environment plus a separate evaluation environment; process isolation
-is required for future concurrent OFF workers.
+for further training; optimizer state is not restored. The launcher supports
+isolated parallel training environments plus a separate evaluation environment.
 Evaluate learned policies against aligned operation with identical initial states
 and episode durations before claiming an energy improvement.
 
@@ -236,8 +298,8 @@ farm rating; `runtime_versions.json` preserves key software versions. Exact resu
 training is not promised by the saved network weights alone: optimizer and all
 RNG/counter states are not restored by the current checkpoint workflow.
 
-`training_metrics.csv` is created at run initialization and gets one row after
-every training episode's network update, before any scheduled evaluation.
+`training_metrics.csv` is created at run initialization and gets one row per
+episode after its round's network update, before any scheduled evaluation.
 Each row is immediately written and the file closed, so it can be inspected while
 training continues. Columns contain the episode number, total environment steps,
 elapsed wall time, each actor's PPO policy loss, the shared critic's value loss,
@@ -437,7 +499,8 @@ nonfinite samples are omitted. Critic and yaw data describe exploratory training
 rollouts; greedy energy comes from separate evaluation episodes.
 
 To screen farm-advantage weights, run matched pilots with the same environment,
-seed, rollout length and optimizer settings and only change `--team-reward-weight`.
+seed, rollout length and optimizer settings, use `--advantage-weight-schedule constant`,
+and only change `--team-reward-weight`.
 For example, run weights `0`, `0.5`, and `1` under distinct experiment names,
 then pass their completed run folders to:
 

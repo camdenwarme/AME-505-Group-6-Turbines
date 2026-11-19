@@ -26,9 +26,9 @@ There are four independent actors, four individual value models, and one shared
 farm critic. Actors retain three local inputs: speed in m/s, meteorological
 wind-from direction in degrees, and local wind-relative yaw in [-180,180).
 Each actor retains the corrected tanh-squashed Gaussian yaw-rate head, bounded
-to [-6,6] deg/s. The medium defaults remain Adam learning rates 0.00035 and
-10 PPO epochs. These are starting settings, not a demonstrated optimum for the
-expanded farm or randomized wind.
+to [-6,6] deg/s. The defaults use Adam learning rates 0.00035 and
+1 PPO epoch, using each episode's data for one training pass. These are starting
+settings, not a demonstrated optimum for the expanded farm or randomized wind.
 
 ### Critic state and targets
 

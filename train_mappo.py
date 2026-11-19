@@ -40,7 +40,15 @@ def main():
     bootstrap.add_argument("--numeric-eval-interval", type=int, default=10,
                            help="Evaluate the greedy policy after this many completed episodes.")
     bootstrap.add_argument("--team-reward-weight", type=float, default=0.5,
-                           help="Weight of the farm advantage in each actor update, from 0 to 1.")
+                           help="Farm weight for --advantage-weight-schedule constant.")
+    bootstrap.add_argument("--advantage-weight-schedule", choices=("exponential", "constant"),
+                           default="exponential", help="Advantage mixing schedule; default exponential.")
+    bootstrap.add_argument("--advantage-decay-beta", type=float, default=0.05,
+                           help="Individual weight = (1-beta)**completed_rounds; default 0.05.")
+    bootstrap.add_argument("--episode-workers", type=int, default=None,
+                           help="Episodes collected in parallel before each update; alias for --n_rollout_threads.")
+    bootstrap.add_argument("--threads-per-worker", type=int, default=1,
+                           help="Numerical-library threads in each simulator process.")
     integration, _ = bootstrap.parse_known_args()
     mappo = integration.mappo_path.resolve()
     if not (mappo / "config.py").is_file():
@@ -55,6 +63,7 @@ def main():
     from train.train import setup_device
     from wind_farm_env import WindFarmEnv
     from wind_profiles import WindProfileConfig
+    from parallel_env import ProcessVecEnv, WindFarmFactory
 
     parser = argparse.ArgumentParser(parents=[bootstrap, get_config()], conflict_handler="resolve")
     parser.set_defaults(env_name="windfarm", experiment_name="square4",
@@ -62,21 +71,31 @@ def main():
                         n_eval_rollout_threads=1, gamma=1.0,
                         use_feature_normalization=False, use_valuenorm=False,
                         lr=3.5e-4, critic_lr=3.5e-4,
-                        ppo_epoch=10)
+                        ppo_epoch=1)
     args = parser.parse_args()
+    if args.episode_workers is not None:
+        args.n_rollout_threads = args.episode_workers
     args.share_policy = False
     if not args.use_centralized_V:
         parser.error("The turbine setup requires a shared centralized critic.")
     if args.use_popart or args.use_valuenorm:
         parser.error("Horizon-scaled farm values use per-horizon loss scaling, not PopArt or ValueNorm.")
-    if args.n_rollout_threads != 1 or args.use_eval:
-        parser.error("This minimal integration supports one training environment and no --use_eval.")
+    if args.n_rollout_threads < 1 or args.threads_per_worker < 1:
+        parser.error("episode-workers and threads-per-worker must be positive.")
+    if args.use_eval:
+        parser.error("Use --numeric-eval-interval instead of --use_eval.")
     if args.episode_length < 1 or args.num_env_steps < args.episode_length:
         parser.error("num_env_steps must cover at least one positive-length episode.")
+    if args.num_env_steps % (args.episode_length * args.n_rollout_threads):
+        parser.error("num_env_steps must be a multiple of episode_length * episode-workers (complete rounds).")
+    if args.ppo_epoch < 1 or args.num_mini_batch < 1:
+        parser.error("ppo_epoch and num_mini_batch must be positive.")
     if args.video_fps is not None and (not np.isfinite(args.video_fps) or args.video_fps <= 0):
         parser.error("video-fps must be positive.")
     if not np.isfinite(args.team_reward_weight) or not 0 <= args.team_reward_weight <= 1:
         parser.error("team-reward-weight must be between 0 and 1.")
+    if not np.isfinite(args.advantage_decay_beta) or not 0 <= args.advantage_decay_beta <= 1:
+        parser.error("advantage-decay-beta must be between 0 and 1.")
     if not np.isfinite(args.gamma) or not 0 <= args.gamma <= 1:
         parser.error("gamma must be between 0 and 1.")
     if args.numeric_eval_interval < 1:
@@ -107,7 +126,7 @@ def main():
         parser.error("Use --algorithm_name rmappo with a recurrent-policy flag, or mappo without one.")
     if args.use_recurrent_policy and args.episode_length % args.data_chunk_length:
         parser.error("episode_length must be divisible by data_chunk_length for recurrent training.")
-    if args.use_recurrent_policy and args.episode_length // args.data_chunk_length < max(2, args.num_mini_batch):
+    if args.use_recurrent_policy and args.episode_length * args.n_rollout_threads // args.data_chunk_length < max(2, args.num_mini_batch):
         parser.error("Recurrent training needs at least two sequence chunks and one per minibatch.")
 
     torch.manual_seed(args.seed)
@@ -128,7 +147,17 @@ def main():
     (run_dir / "runtime_versions.json").write_text(json.dumps(versions, indent=2))
 
     env.seed(args.seed)
-    envs = DummyVecEnv([lambda: env])
+    if args.n_rollout_threads == 1:
+        envs = DummyVecEnv([lambda: env])
+    else:
+        factories = [WindFarmFactory(dict(
+            episode_length=args.episode_length, dt=args.dt, wind_speed=args.wind_speed,
+            wind_direction=args.wind_direction, layout=env.layout_d,
+            wind_config=train_wind, wind_stream=0, environment_id=i), args.seed + i)
+            for i in range(args.n_rollout_threads)]
+        envs = ProcessVecEnv(factories, gamma=args.gamma, threads=args.threads_per_worker)
+    print(f"Collecting {args.n_rollout_threads} episode(s) per round; "
+          f"{args.ppo_epoch} training pass(es) after each round.", flush=True)
 
     def record_evaluation(episode, policies):
         from evaluate_wind_farm import evaluate_episode
