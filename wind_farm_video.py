@@ -166,8 +166,10 @@ def record_policy_video(env, policies, output_path, fps=None, episode=None, *, s
         energy_history = [0.0]
         snapshots = [evaluation_snapshot(env, obs, 0, np.zeros(len(policies)))]
         renderer = WindFarmVideo(fps, episode)
+        # ImageIO supplies the input FPS explicitly, so FFmpeg can skip rate probing.
         with imageio.get_writer(output_path, format="FFMPEG", fps=fps,
-                                codec="libx264", quality=8, macro_block_size=16) as writer:
+                                codec="libx264", quality=8, macro_block_size=16,
+                                input_params=["-fpsprobesize", "0"]) as writer:
             writer.append_data(renderer.frame(env, obs, np.zeros(len(policies)), times, powers))
             for step in range(env.episode_length):
                 actions = []
