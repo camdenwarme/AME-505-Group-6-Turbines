@@ -17,7 +17,8 @@ def main():
     bootstrap.add_argument("--wind-speed", type=float, default=8.0)
     bootstrap.add_argument("--wind-direction", type=float, default=270.0)
     bootstrap.add_argument("--layout-file", type=Path, default=None,
-                           help="JSON array of [x,y] or [x,y,z] turbine positions in rotor diameters; default square4.")
+                           help="Layout JSON in rotor diameters: a {\"turbines\", \"neighbors\"} object "
+                                "(see README_GRAPH_LAYER.md) or a bare [[x, y], ...] array; default square4.")
     bootstrap.add_argument("--wind-mode", choices=("off", "speed", "direction", "both"), default="off",
                            help="Toggle seeded, time-varying wind inside every episode.")
     bootstrap.add_argument("--wind-seed", type=int, default=None,
@@ -51,6 +52,19 @@ def main():
     bootstrap.add_argument("--episodes-per-update", type=int, default=1,
                            help="Complete training episodes per PPO update. Each runs in its own "
                                 "simulator, stepped one after another in this process. 1 = original behaviour.")
+    # Neighbour-graph actor encoder (README_GRAPH_LAYER.md). Off = original actors.
+    bootstrap.add_argument("--graph-layer", choices=("off", "on"), default="off",
+                           help="Add a graph-attention encoder over neighbouring turbines in front of each actor.")
+    bootstrap.add_argument("--graph-hops", type=int, default=1,
+                           help="Each actor sees turbines up to this many neighbour links away.")
+    bootstrap.add_argument("--graph-layers", type=int, default=None,
+                           help="Message-passing layers; defaults to --graph-hops.")
+    bootstrap.add_argument("--graph-hidden", type=int, default=64,
+                           help="Graph embedding width (must be divisible by --graph-heads).")
+    bootstrap.add_argument("--graph-heads", type=int, default=4)
+    bootstrap.add_argument("--graph-messages", choices=("both", "upwind"), default="both",
+                           help="both: every link carries messages both ways, weighted by wind-frame edge "
+                                "features; upwind: drop messages from turbines downstream of the receiver.")
     integration, _ = bootstrap.parse_known_args()
     mappo = integration.mappo_path.resolve()
     if not (mappo / "config.py").is_file():
@@ -63,6 +77,7 @@ def main():
     from envs.env_wrappers import DummyVecEnv
     from shared_critic_runner import SharedCriticRunner as EnvRunner
     from train.train import setup_device
+    from turbine_graph import TurbineGraph, load_layout
     from wind_farm_env import WindFarmEnv
     from wind_profiles import WindProfileConfig
 
@@ -113,12 +128,26 @@ def main():
                              knot_interval_s=args.wind_knot_interval)
         train_wind = WindProfileConfig(seed=args.wind_seed, **wind_settings)
         eval_wind = WindProfileConfig(seed=args.eval_wind_seed, **wind_settings)
-        layout = None if args.layout_file is None else json.loads(args.layout_file.read_text())
+        layout_spec = None if args.layout_file is None else load_layout(args.layout_file)
+        layout = None if layout_spec is None else layout_spec.positions_d
+        graph = None
+        if args.graph_layer == "on":
+            if layout_spec is None:
+                default = ROOT / "layouts" / "square4.json"
+                layout_spec = load_layout(default)
+                if not np.allclose(layout_spec.positions_d[:, :2], WindFarmEnv.default_layout_d):
+                    raise ValueError(f"{default} no longer matches the default square4 layout.")
+            if args.graph_layers is not None and args.graph_layers < 1:
+                raise ValueError("graph-layers must be positive.")
+            if args.graph_hidden < 1 or args.graph_heads < 1 or args.graph_hidden % args.graph_heads:
+                raise ValueError("graph-hidden must be a positive multiple of graph-heads.")
+            graph = TurbineGraph.from_layout(layout_spec, hops=args.graph_hops,
+                                             messages=args.graph_messages)
         # Multi-episode batches: environment_id gives each training simulator its
         # own seeded wind stream; environment 0 is the original single environment.
         train_envs = [WindFarmEnv(args.episode_length, args.dt, args.wind_speed,
                                   args.wind_direction, layout=layout, wind_config=train_wind,
-                                  wind_stream=0, environment_id=index)
+                                  wind_stream=0, environment_id=index, graph=graph)
                       for index in range(args.episodes_per_update)]
         env = train_envs[0]
     except (ValueError, OSError, TypeError) as exc:
@@ -126,6 +155,9 @@ def main():
     args.num_agents = env.num_agents
     args.scenario_name = "square4" if layout is None else f"farm_{args.num_agents}"
     args.layout_d = env.layout_d.tolist()
+    if graph is not None:
+        args.graph = graph.describe()
+        args.turbine_names = layout_spec.names
     args.remaining_time_index = env.remaining_time_index
     args.total_rated_power_w = env.total_rated_power_w
     args.training_wind_config = train_wind.to_dict()
@@ -168,7 +200,7 @@ def main():
     def make_evaluation_env():
         return WindFarmEnv(args.episode_length, args.dt, args.wind_speed,
                            args.wind_direction, layout=env.layout_d,
-                           wind_config=eval_wind, wind_stream=1)
+                           wind_config=eval_wind, wind_stream=1, graph=graph)
 
     def refresh_charts():
         """Rebuild every chart and the HTML report from the CSVs written so far.

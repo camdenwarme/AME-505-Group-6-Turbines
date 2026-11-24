@@ -58,7 +58,8 @@ def evaluation_snapshot(env, obs, tick, rates, infos=None, commands=None):
         turbine = turbines[i] if turbines else None
         position = turbine.base_location[:2] if turbine is not None else (np.nan, np.nan)
         heading = turbine.get_yaw_orientation() if turbine is not None else np.nan
-        values = (position[0], position[1], heading, *obs[i], float(commands[i]), float(rates[i]),
+        # obs[i][:3] = local speed/direction/yaw; graph observations append more after it.
+        values = (position[0], position[1], heading, *obs[i][:3], float(commands[i]), float(rates[i]),
                   float(powers[i]), float(energies[i]))
         for field, value in zip(("x_m", "y_m", "heading_deg", "local_wind_speed_m_s",
                                  "local_wind_direction_deg", "yaw_deg", "commanded_rate_deg_s", "applied_rate_deg_s",
