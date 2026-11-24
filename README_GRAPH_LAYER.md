@@ -264,7 +264,7 @@ The full diff is `git diff mappo_4_turbines graph_layer`.
   hop; six turbines with 2 hops, upwind messages and a GRU; and square4 with
   `--episodes-per-update 2 --evaluate-aligned-baseline --final-video` (both
   videos rendered, and `models_best` reloaded into the graph actors).
-- **Unit tests:** `.venv/Scripts/python.exe -m unittest` gives `Ran 56 tests ... OK`.
+- **Unit tests:** `.venv/Scripts/python.exe -m unittest` gives `Ran 56 tests ... OK` on `graph_layer` (57 after merging the wind-aligned benchmark test).
   That is the previous 47 plus the 9 new ones.
 
 These short runs check the plumbing only. They are far too short to show any

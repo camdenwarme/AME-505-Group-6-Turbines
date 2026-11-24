@@ -1,5 +1,20 @@
 # Changelog
 
+## 2026-11-24: Rate-limited wind-aligned benchmark (`wind_aligned`)
+
+Ported from Jack Brower's `mappo_4_turbines_jack` commit `e8bf437` (only the
+baseline; nothing else from that commit). Every turbine yaws toward its
+measured local wind direction, like Jack's ideal controller, but rate-limited
+to the actuator bounds of [-6, 6] deg/s (`evaluate_wind_farm.wind_aligned_rates`).
+It runs once at episode 0 on the evaluation scenario and is recorded in
+`evaluation_metrics.csv` as policy `wind_aligned`, with its trajectory in
+`wind_aligned_steps.csv`. `--no-wind-aligned-episode-zero` skips it. Under
+dynamic wind it matches the existing `yaw_tracking_baseline`. With constant
+wind (`--wind-mode off`) it still tracks local inflow, where the old aligned
+baseline holds its initial headings. Training is unaffected: training,
+rollout and greedy-evaluation CSVs were unchanged in a seeded check. The
+charts do not draw this benchmark yet.
+
 ## 2026-11-24: Optional neighbour graph layer for the actors (`--graph-layer`)
 
 `--graph-layer on` puts a graph-attention encoder in front of each turbine's
