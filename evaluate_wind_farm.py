@@ -7,6 +7,28 @@ import numpy as np
 import torch
 
 
+# Benchmark ported from Jack Brower's mappo_4_turbines_jack commit e8bf437:
+# every turbine turns to face its measured local inflow. Unlike that ideal
+# controller (instant re-heading), this one is limited to the actuator's yaw
+# rate bounds (the action space, [-6, 6] deg/s), like the learned actors.
+WIND_ALIGNED_POLICY = "wind_aligned"
+
+
+def wind_aligned_rates(env, obs):
+    """Yaw rates that turn each rotor toward its measured local wind, saturated.
+
+    obs[:, 2] is the wind-relative yaw (local wind-from direction minus rotor
+    heading, wrapped to [-180, 180)), so yaw / dt would close the error in one
+    step. Positive rates increase the heading. Rates are clipped to each
+    turbine's action-space bounds.
+    """
+    actions = np.zeros((len(env.action_space), 1), dtype=np.float32)
+    actions[:, 0] = np.asarray(obs)[:, 2] / env.dt
+    for i, space in enumerate(env.action_space):
+        actions[i] = np.clip(actions[i], space.low, space.high)
+    return actions
+
+
 def scenario_metadata(env):
     """Return stable identifiers for the wind scenario being replayed."""
     scenario = getattr(env, "current_scenario", getattr(env, "wind_scenario", None))
@@ -56,14 +78,18 @@ def write_evaluation_trajectory(path, rows):
 
 
 @torch.no_grad()
-def evaluate_episode(env, policies=None, *, scenario=None, trajectory_path=None):
+def evaluate_episode(env, policies=None, *, scenario=None, trajectory_path=None, wind_aligned=False):
     """Evaluate a policy or initially aligned fixed headings on one scenario.
 
     An explicit scenario prevents baseline/policy/video resets from sampling
     different winds. In dynamic wind modes the baseline tracks measured local
     wind with the same actuator bounds; fixed wind retains initially aligned
     headings for compatibility with the historical reference.
+    wind_aligned=True instead tracks the local inflow in every wind mode,
+    rate-limited (see wind_aligned_rates); it cannot be combined with policies.
     """
+    if wind_aligned and policies is not None:
+        raise ValueError("The wind-aligned benchmark cannot be combined with learned policies.")
     modes = [] if policies is None else [p.actor.training for p in policies]
     count = len(env.action_space)
     if policies is not None and len(policies) != count:
@@ -86,11 +112,10 @@ def evaluate_episode(env, policies=None, *, scenario=None, trajectory_path=None)
         snapshots = [evaluation_snapshot(env, obs, 0, np.zeros(count))] if trajectory_path else []
         for tick in range(1, env.episode_length + 1):
             if policies is None:
-                actions = np.zeros((count, 1), dtype=np.float32)
-                if mode != "off":
-                    actions[:, 0] = obs[:, 2] / env.dt
-                    for i, space in enumerate(env.action_space):
-                        actions[i] = np.clip(actions[i], space.low, space.high)
+                if wind_aligned or mode != "off":
+                    actions = wind_aligned_rates(env, obs)
+                else:
+                    actions = np.zeros((count, 1), dtype=np.float32)
             else:
                 actions = []
                 for i, policy in enumerate(policies):
@@ -110,7 +135,7 @@ def evaluate_episode(env, policies=None, *, scenario=None, trajectory_path=None)
             write_evaluation_trajectory(trajectory_path, snapshots)
         metadata = scenario_metadata(env)
         result = {"scenario_id": metadata["scenario_id"],
-                  "baseline_kind": baseline_kind if policies is None else "",
+                  "baseline_kind": baseline_kind if policies is None and not wind_aligned else "",
                   "wind_episode_id": metadata["episode_id"],
                   "wind_episode_seed": metadata["episode_seed"],
                   "num_agents": count,

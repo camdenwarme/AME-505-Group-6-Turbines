@@ -18,6 +18,33 @@ def two_env(*args, **kwargs):
 
 
 class WindFarmEnvTests(unittest.TestCase):
+    def test_wind_aligned_benchmark_tracks_local_wind_within_rate_bounds(self):
+        from evaluate_wind_farm import evaluate_episode, wind_aligned_rates
+        # A 60 degree shift in 4 s needs 15 deg/s, so the benchmark must saturate.
+        scenario = WindScenario([0, 4, 24], [8, 8, 8], [270, 330, 330], mode="direction")
+        env = two_env(episode_length=6)
+        try:
+            with tempfile.TemporaryDirectory() as directory:
+                path = Path(directory) / "wind_aligned_steps.csv"
+                result = evaluate_episode(env, scenario=scenario, wind_aligned=True, trajectory_path=path)
+                import csv
+                with path.open(newline="", encoding="utf-8") as stream:
+                    rows = list(csv.DictReader(stream))
+            self.assertEqual(result["baseline_kind"], "")
+            rates = np.array([[float(row[f"turbine{i}_applied_rate_deg_s"]) for i in range(2)]
+                              for row in rows[1:]])
+            yaw = np.array([[float(row[f"turbine{i}_yaw_deg"]) for i in range(2)] for row in rows])
+            self.assertTrue((np.abs(rates) <= 6 + 1e-9).all())
+            self.assertTrue(np.isclose(np.abs(rates), 6).any())
+            self.assertLess(np.abs(yaw[-1]).max(), np.abs(yaw).max())
+            fake = SimpleNamespace(dt=4.0, action_space=env.action_space)
+            np.testing.assert_allclose(
+                wind_aligned_rates(fake, np.array([[8, 270, 40.0], [8, 270, -2.0]]))[:, 0], [6, -0.5])
+            with self.assertRaises(ValueError):
+                evaluate_episode(env, policies=[object(), object()], scenario=scenario, wind_aligned=True)
+        finally:
+            env.close()
+
     def test_four_turbine_square_shapes_energy_and_metadata(self):
         env = WindFarmEnv(episode_length=2)
         try:

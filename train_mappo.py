@@ -40,6 +40,9 @@ def main():
                                 "and the best greedy policy (models_best) once each.")
     bootstrap.add_argument("--evaluate-aligned-baseline", action="store_true",
                            help="Also simulate an aligned reference during evaluation.")
+    bootstrap.add_argument("--wind-aligned-episode-zero", action=argparse.BooleanOptionalAction, default=True,
+                           help="At episode 0, also evaluate the rate-limited benchmark in which every turbine "
+                                "yaws toward its measured local wind (policy 'wind_aligned'). On by default.")
     bootstrap.add_argument("--numeric-eval-interval", type=int, default=10,
                            help="Evaluate the greedy policy after this many completed episodes.")
     bootstrap.add_argument("--team-reward-weight", type=float, default=0.5,
@@ -189,7 +192,7 @@ def main():
                 print(f"Chart refresh skipped {function.__name__}: {error}", flush=True)
 
     def record_evaluation(episode, policies):
-        from evaluate_wind_farm import evaluate_episode
+        from evaluate_wind_farm import WIND_ALIGNED_POLICY, evaluate_episode
         # Separate simulator: evaluation must not reset the training environment
         # or invalidate the observations/recurrent states carried in its buffer.
         evaluation_env = make_evaluation_env()
@@ -205,6 +208,10 @@ def main():
             # A physically simulated aligned benchmark is optional; individual
             # GAE baseline values are computed analytically without that rollout.
             records = []
+            if episode == 0 and args.wind_aligned_episode_zero:
+                records.append({"episode": episode, "policy": WIND_ALIGNED_POLICY,
+                                **evaluate_episode(evaluation_env, scenario=scenario, wind_aligned=True,
+                                  trajectory_path=run_dir / f"{WIND_ALIGNED_POLICY}_steps.csv")})
             if episode == 0 and args.evaluate_aligned_baseline:
                 kind = "aligned_baseline" if args.wind_mode == "off" else "yaw_tracking_baseline"
                 records.append({"episode": episode, "policy": kind,
