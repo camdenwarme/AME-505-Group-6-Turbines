@@ -23,6 +23,14 @@ from fdynsim import DEFAULT_CASE, REPO
 from wind_profiles import WindProfileConfig, WindScenario, make_wind_scenario
 
 
+def _wind_from_direction(velocity):
+    return (270 - np.rad2deg(np.arctan2(velocity[:, 1], velocity[:, 0]))) % 360
+
+
+def _wrap_yaw(angle):
+    return (angle + 180) % 360 - 180
+
+
 class _YawRateController:
     def __init__(self, dt, direction, num_agents, prepare_next_tick):
         self.dt, self.direction = dt, direction
@@ -47,6 +55,31 @@ class _YawRateController:
         import pandas as pd
         return pd.DataFrame([{"t_idx": i_t, "time": t,
                               "orientation": turbine.get_yaw_orientation()}])
+
+
+class WindAlignedPolicy(_YawRateController):
+    """Ideal controller that faces the current local inflow at every tick."""
+
+    def __init__(self, dt, direction, num_agents, prepare_next_tick):
+        super().__init__(dt, direction, num_agents, prepare_next_tick)
+        self._has_heading = False
+
+    def align_to_inflow(self, turbines, local_directions):
+        offsets = _wrap_yaw(local_directions - self.direction)
+        headings = self.direction + offsets
+        if self._has_heading:
+            self.applied_rates[:] = _wrap_yaw(headings - self.headings) / self.dt
+        self._has_heading = True
+        self.headings[:] = headings
+        for turbine, offset in zip(turbines, offsets):
+            # Save the actual heading and its ambient-relative yaw for wakes
+            # propagated from this tick. The actor yaw is local-relative.
+            turbine.set_yaw(self.direction, -offset)
+
+    def __call__(self, turbine, i_t, t):
+        # FLORIS first samples the incoming flow at the ambient-aligned rotor
+        # and applies zero yaw loss for an ideal rotor facing that inflow.
+        turbine.set_yaw(self.direction, 0.0)
 
 
 class WindFarmEnv:
@@ -143,7 +176,8 @@ class WindFarmEnv:
         finally:
             os.chdir(previous)
 
-    def reset(self, scenario=None):
+    def reset(self, scenario=None, *, wind_aligned=False):
+        """Start a rollout, optionally using ideal local-wind alignment."""
         self.close()
         if scenario is None:
             scenario = self.make_scenario()
@@ -204,8 +238,10 @@ class WindFarmEnv:
                     turbine.set_yaw(self.wind_direction, 0.0)
                     turbine.turbine_states.init_all_states(
                         turbine.turbine_states.get_all_states()[0].copy())
-                self.controller = _YawRateController(self.dt, scenario.direction_unwrapped(0.0),
-                                                     self.num_agents, self._prepare_next_tick)
+                controller_args = (self.dt, scenario.direction_unwrapped(0.0),
+                                   self.num_agents, self._prepare_next_tick)
+                controller = WindAlignedPolicy if wind_aligned else _YawRateController
+                self.controller = controller(*controller_args)
                 sim.controller = self.controller
                 self._iterator = sim.iter_sim()
                 self._steps, self.energy_j = 0, 0.0
@@ -232,13 +268,15 @@ class WindFarmEnv:
         self._turbine_power = latest["Power_FLORIS"].to_numpy(dtype=float)
         power = float(np.sum(self._turbine_power))
         speed = np.linalg.norm(velocity, axis=1)
-        direction = (270 - np.rad2deg(np.arctan2(velocity[:, 1], velocity[:, 0]))) % 360
-        headings = np.array([t.get_yaw_orientation()
-                             for t in self.interface.wind_farm.turbines])
+        direction = _wind_from_direction(velocity)
+        turbines = self.interface.wind_farm.turbines
+        if isinstance(self.controller, WindAlignedPolicy):
+            self.controller.align_to_inflow(turbines, direction)
+        headings = np.array([t.get_yaw_orientation() for t in turbines])
         # OFF convention: yaw = LOCAL wind-from direction minus rotor heading.
         # FLORIS supplies a rotor-averaged world-coordinate vector, including
         # lateral flow, not a vector reconstructed from ambient direction.
-        yaw = (direction - headings + 180) % 360 - 180
+        yaw = _wrap_yaw(direction - headings)
         obs = np.column_stack((speed, direction, yaw)).astype(np.float32)
         if (self._turbine_power.shape != (self.num_agents,) or obs.shape != (self.num_agents, 3)
                 or not np.isfinite(obs).all() or not np.isfinite(power)):
@@ -292,15 +330,20 @@ class WindFarmEnv:
                                     self._aligned_curve_power_w, left=0.0, right=0.0)
         return (aligned_power_w / self.turbine_rated_power_w * discount_sum).astype(np.float32)
 
-    def step(self, actions):
+    def step(self, actions=None):
+        """Advance one tick using yaw rates or the active wind-aligned policy."""
         if self._iterator is None or self._steps >= self.episode_length:
             raise RuntimeError("Call reset() before stepping a new episode.")
-        rates = np.asarray(actions, dtype=float)
-        if rates.shape != (self.num_agents, 1) or not np.isfinite(rates).all():
-            raise ValueError(f"Expected finite yaw rates with shape ({self.num_agents}, 1).")
-        # Preserve the runner's original samples/log probabilities in its buffer;
-        # actuator saturation is part of the environment transition.
-        self.controller.rates = np.clip(rates[:, 0], -6, 6)
+        if isinstance(self.controller, WindAlignedPolicy):
+            if actions is not None:
+                raise ValueError("The wind-aligned policy sets its own headings.")
+        else:
+            rates = np.asarray(actions, dtype=float)
+            if rates.shape != (self.num_agents, 1) or not np.isfinite(rates).all():
+                raise ValueError(f"Expected finite yaw rates with shape ({self.num_agents}, 1).")
+            # Preserve the runner's original samples/log probabilities in its buffer;
+            # actuator saturation is part of the environment transition.
+            self.controller.rates = np.clip(rates[:, 0], -6, 6)
         with self._scope():
             obs, power = self._measure()
         turbine_interval_energy = 0.5 * (self._previous_turbine_power + self._turbine_power) * self.dt

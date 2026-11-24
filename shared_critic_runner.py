@@ -16,6 +16,7 @@ from algorithms.algorithm.r_actor_critic import R_Critic
 from bounded_action_head import install_bounded_action_head
 from horizon_critic import HorizonScaledCritic
 from runner.separated.env_runner import EnvRunner as SeparatedRunner
+from utils.separated_buffer import SeparatedReplayBuffer
 from utils.util import get_gard_norm
 
 
@@ -161,20 +162,11 @@ class SharedCriticRunner(SeparatedRunner):
             raise ValueError("advantage_decay_beta must be between 0 and 1.")
         self._constant_team_reward_weight = self.team_reward_weight
         self._set_advantage_weights()
-        self.individual_rewards = np.zeros(
-            (self.episode_length, self.n_rollout_threads, self.num_agents, 1), dtype=np.float32)
-        self.individual_reference = np.zeros(
-            (self.episode_length + 1, self.n_rollout_threads, self.num_agents, 1), dtype=np.float32)
+        self._allocate_rollout_storage()
         self.individual_horizons = _discounted_horizons(self.episode_length, self.buffer[0].gamma)
         self.numeric_eval_interval = int(getattr(args, "numeric_eval_interval", 10))
         if self.numeric_eval_interval < 1:
             raise ValueError("numeric_eval_interval must be positive.")
-        self._rollout_physical = np.full(
-            (self.episode_length, self.n_rollout_threads, self.num_agents, 2), np.nan, dtype=np.float64)
-        self._rollout_farm_power = np.full(
-            (self.episode_length, self.n_rollout_threads), np.nan, dtype=np.float64)
-        self._rollout_conditions = [[{} for _ in range(self.n_rollout_threads)]
-                                    for _ in range(self.episode_length)]
         self._episode_conditions = {}
         self._scenario_events = set()
         self.scenarios_path = Path(self.run_dir) / "wind_scenarios.jsonl"
@@ -233,6 +225,29 @@ class SharedCriticRunner(SeparatedRunner):
         if self.model_dir is not None:
             self.restore()
 
+    def _allocate_rollout_storage(self):
+        ticks, workers, agents = self.episode_length, self.n_rollout_threads, self.num_agents
+        self.individual_rewards = np.zeros((ticks, workers, agents, 1), dtype=np.float32)
+        self.individual_reference = np.zeros((ticks + 1, workers, agents, 1), dtype=np.float32)
+        self._rollout_physical = np.full((ticks, workers, agents, 2), np.nan, dtype=np.float64)
+        self._rollout_farm_power = np.full((ticks, workers), np.nan, dtype=np.float64)
+        self._rollout_conditions = [[{} for _ in range(workers)] for _ in range(ticks)]
+
+    def _set_rollout_workers(self, count):
+        if count == self.n_rollout_threads:
+            return
+        # Each round starts fresh episodes. Size the buffers to the active
+        # workers so PPO and the critics only train on collected transitions.
+        args = copy.copy(self.all_args)
+        args.n_rollout_threads = count
+        self.buffer = [SeparatedReplayBuffer(args, obs, shared_obs, action)
+                       for obs, shared_obs, action in zip(self.envs.observation_space,
+                                                         self.envs.share_observation_space,
+                                                         self.envs.action_space)]
+        self.envs.use_workers(count)
+        self.n_rollout_threads = count
+        self._allocate_rollout_storage()
+
     def _evaluate_episode(self, episode):
         if self._episode_callback is None:
             return
@@ -265,10 +280,13 @@ class SharedCriticRunner(SeparatedRunner):
         from parallel_env import ProcessVecEnv
         if not isinstance(self.envs, ProcessVecEnv):
             return super().run()
-        rounds = int(self.num_env_steps) // self.episode_length // self.n_rollout_threads
+        total_episodes = int(self.num_env_steps) // self.episode_length
+        workers = self.all_args.n_rollout_threads
+        rounds = (total_episodes + workers - 1) // workers
         for round_index in range(rounds):
             # Workers remain at the preceding terminal state throughout training.
             # Reset starts the next round only after every optimizer has finished.
+            self._set_rollout_workers(min(workers, total_episodes - self._completed_episodes))
             self.warmup()
             if self.use_linear_lr_decay:
                 for trainer in self.trainer:

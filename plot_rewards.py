@@ -20,7 +20,7 @@ def _style(axis, values):
 
 
 def evaluation_series(run_dir, field):
-    """Get per-episode greedy values and optional aligned value for a plot.
+    """Get greedy and wind-aligned evaluation points and the optional benchmark.
 
     Numeric evaluation CSV values take precedence. Legacy NPZ evaluation
     histories fill missing episodes, so a rendered evaluation is never plotted
@@ -29,7 +29,7 @@ def evaluation_series(run_dir, field):
     if field not in ("team_return", "farm_energy_mwh"):
         raise ValueError(f"Unsupported evaluation field: {field}")
     run_dir = Path(run_dir)
-    greedy, baseline = {}, None
+    greedy, wind_aligned, baseline = {}, {}, None
     path = run_dir / "evaluation_metrics.csv"
     if path.exists():
         with path.open(newline="", encoding="utf-8") as stream:
@@ -41,6 +41,8 @@ def evaluation_series(run_dir, field):
                     raise ValueError(f"Nonfinite {field} in {path}")
                 if row.get("policy") == "greedy":
                     greedy[int(row["episode"])] = value
+                elif row.get("policy") == "wind_aligned":
+                    wind_aligned[int(row["episode"])] = value
                 elif row.get("policy") in ("aligned_baseline", "yaw_tracking_baseline"):
                     baseline = value
 
@@ -50,7 +52,7 @@ def evaluation_series(run_dir, field):
              else r"evaluation_energy_episode(\d+)\.npz")
     for path in run_dir.glob(pattern):
         match = re.fullmatch(regex, path.name)
-        if not match or int(match[1]) in greedy:
+        if not match or int(match[1]) in greedy or int(match[1]) in wind_aligned:
             continue
         with np.load(path, allow_pickle=False) as data:
             values = np.asarray(data["reward" if field == "team_return" else "energy_j"], float)
@@ -58,7 +60,7 @@ def evaluation_series(run_dir, field):
                 raise ValueError(f"Invalid evaluation history in {path}")
             value = float(values.sum() if field == "team_return" else values[-1] / 3.6e9)
         greedy[int(match[1])] = value
-    return sorted(greedy.items()), baseline
+    return sorted(greedy.items()), sorted(wind_aligned.items()), baseline
 
 
 def evaluation_baseline_label(run_dir):
@@ -108,9 +110,9 @@ def plot_reward_summary(run_dir):
             series.append(("Training (exploration)", "#1768ac",
                            [int(r["episode"]) for r in rows],
                            [float(r["episode_return"]) for r in rows]))
-    evaluations, baseline = evaluation_series(run_dir, "team_return")
-    if evaluations:
-        episodes, returns = zip(*sorted(evaluations))
+    greedy, _, baseline = evaluation_series(run_dir, "team_return")
+    if greedy:
+        episodes, returns = zip(*greedy)
         series.append(("Evaluation (greedy policy)", "#b76a12", episodes, returns))
     if not series and baseline is None:
         raise ValueError("No recorded episode reward data are available to plot.")

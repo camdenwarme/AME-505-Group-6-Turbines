@@ -1,4 +1,4 @@
-"""Render an evaluation rollout using the actors' greedy policy to MP4."""
+"""Render a deterministic wind-farm evaluation rollout to MP4."""
 
 from pathlib import Path
 
@@ -6,7 +6,7 @@ from plot_evaluation_states import plot_evaluation_states
 from plot_evaluation_energy import plot_evaluation_energy
 from plot_rewards import plot_evaluation_rewards
 from training_report import write_evaluation_state_report
-from evaluate_wind_farm import evaluation_snapshot, write_evaluation_trajectory, scenario_metadata
+from evaluate_wind_farm import evaluation_controls, evaluation_snapshot, write_evaluation_trajectory, scenario_metadata
 
 import imageio.v2 as imageio
 from matplotlib.backends.backend_agg import FigureCanvasAgg
@@ -22,9 +22,10 @@ WIND = "#5ce0c5"
 
 
 class WindFarmVideo:
-    def __init__(self, fps, episode=None):
+    def __init__(self, fps, episode=None, policy="greedy"):
         self.fps = fps
         self.episode = episode
+        self.policy = policy.replace("wind_aligned", "wind-aligned").replace("_", " ")
         self.figure = Figure(figsize=(12.8, 8), dpi=100, facecolor=BACKGROUND)
         self.canvas = FigureCanvasAgg(self.figure)
 
@@ -130,15 +131,16 @@ class WindFarmVideo:
         for spine in power.spines.values():
             spine.set_color("#35465b")
         fig.text(0.055, 0.025,
-                 f"Top view • evaluation (greedy policy, no exploration) • {env.dt * self.fps:g}× simulation speed • "
+                 f"Top view • {self.policy} policy evaluation • {env.dt * self.fps:g}× simulation speed • "
                  "wake field not drawn", color="#a5b4c8", fontsize=9)
         self.canvas.draw()
         return np.asarray(self.canvas.buffer_rgba())[:, :, :3].copy()
 
 
 @torch.no_grad()
-def record_policy_video(env, policies, output_path, fps=None, episode=None, *, scenario=None):
-    """Use actor means, recording video and per-turbine state-history plots.
+def record_policy_video(env, policies, output_path, fps=None, episode=None, *, scenario=None,
+                        wind_aligned=False):
+    """Record a policy's video and per-turbine state-history plots.
 
     By default, each frame lasts dt / 10 seconds (10x simulated-time playback).
     Uses the raw environment so the last frame is the terminal state, rather
@@ -150,33 +152,22 @@ def record_policy_video(env, policies, output_path, fps=None, episode=None, *, s
         raise ValueError("Video FPS must be positive.")
     output_path = Path(output_path)
     output_path.parent.mkdir(parents=True, exist_ok=True)
-    training_modes = [policy.actor.training for policy in policies]
-    try:
-        for policy in policies:
-            policy.actor.eval()
-        if len(policies) != len(env.action_space):
-            raise ValueError("Expected one policy per turbine.")
-        obs = env.reset() if scenario is None else env.reset(scenario=scenario)
+    with evaluation_controls(env, policies, scenario, wind_aligned=wind_aligned) as (obs, control, kind):
         observations = [obs.copy()]
-        states = [np.zeros((1, policy.actor._recurrent_N, policy.actor.hidden_size), np.float32)
-                  for policy in policies]
-        mask = np.ones((1, 1), np.float32)
         times, powers = [0.0], [env._power]
         reward_history = []
         energy_history = [0.0]
-        snapshots = [evaluation_snapshot(env, obs, 0, np.zeros(len(policies)))]
-        renderer = WindFarmVideo(fps, episode)
+        initial_rates = np.zeros(len(env.action_space))
+        snapshots = [evaluation_snapshot(env, obs, 0, initial_rates)]
+        renderer = WindFarmVideo(fps, episode, kind)
         # ImageIO supplies the input FPS explicitly, so FFmpeg can skip rate probing.
         with imageio.get_writer(output_path, format="FFMPEG", fps=fps,
                                 codec="libx264", quality=8, macro_block_size=16,
                                 input_params=["-fpsprobesize", "0"]) as writer:
-            writer.append_data(renderer.frame(env, obs, np.zeros(len(policies)), times, powers))
+            writer.append_data(renderer.frame(env, obs, initial_rates, times, powers))
             for step in range(env.episode_length):
-                actions = []
-                for i, policy in enumerate(policies):
-                    action, states[i] = policy.act(obs[i:i + 1], states[i], mask, deterministic=True)
-                    actions.append(action.detach().cpu().numpy()[0])
-                obs, rewards, dones, infos = env.step(np.stack(actions))
+                actions = None if control is None else control(obs)
+                obs, _, dones, infos = env.step(actions)
                 # The environment now returns turbine-specific rewards; plots
                 # labeled as farm reward must use the separately reported team value.
                 reward_history.append(float(infos[0]["team_reward"]))
@@ -185,7 +176,7 @@ def record_policy_video(env, policies, output_path, fps=None, episode=None, *, s
                 times.append((step + 1) * env.dt)
                 powers.append(infos[0]["farm_power_w"])
                 rates = [item["yaw_rate_deg_s"] for item in infos]
-                snapshots.append(evaluation_snapshot(env, obs, step + 1, rates, infos, np.stack(actions)))
+                snapshots.append(evaluation_snapshot(env, obs, step + 1, rates, infos, actions))
                 writer.append_data(renderer.frame(env, obs, rates, times, powers))
                 if np.all(dones):
                     break
@@ -196,6 +187,3 @@ def record_policy_video(env, policies, output_path, fps=None, episode=None, *, s
             plot_evaluation_energy(times, energy_history, output_path.parent, episode)
             write_evaluation_state_report(output_path.parent)
         return output_path
-    finally:
-        for policy, training in zip(policies, training_modes):
-            policy.actor.train(training)

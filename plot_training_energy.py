@@ -30,9 +30,9 @@ def plot_training_energy(metrics_path):
     axis.plot(episodes, energy, color="#1768ac", linewidth=1.5,
               marker="o", markersize=3, label="Training (exploration)")
     values, all_episodes = list(energy), list(episodes)
-    evaluations, baseline = evaluation_series(metrics_path.parent, "farm_energy_mwh")
-    if evaluations:
-        eval_episodes, eval_energy = zip(*evaluations)
+    greedy, wind_aligned, baseline = evaluation_series(metrics_path.parent, "farm_energy_mwh")
+    if greedy:
+        eval_episodes, eval_energy = zip(*greedy)
         axis.plot(eval_episodes, eval_energy, color="#b76a12", linewidth=1.5,
                   marker="o", markersize=3, label="Evaluation (greedy policy)")
         values.extend(eval_energy)
@@ -41,6 +41,11 @@ def plot_training_energy(metrics_path):
         axis.axhline(baseline, color="#536276", linestyle="--", linewidth=1.2,
                      label=evaluation_baseline_label(metrics_path.parent))
         values.append(baseline)
+    if wind_aligned:
+        wind_aligned_energy = wind_aligned[-1][1]
+        axis.axhline(wind_aligned_energy, color="#777777", linestyle="--", linewidth=1.2,
+                     label="Wind-aligned benchmark")
+        values.append(wind_aligned_energy)
     axis.set_title("Farm energy within each episode", loc="left",
                    fontsize=12, weight="bold")
     axis.set_ylabel("Energy captured at episode end (MWh)")

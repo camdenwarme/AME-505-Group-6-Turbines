@@ -77,6 +77,7 @@ account for departures from that approximation.
 | `--wind-knot-interval` | 120.0 | Nominal time in seconds between random knots |
 | `--layout-file` | none | JSON layout array; omission selects square4 |
 | `--numeric-eval-interval` | 10 | Completed training episodes between evaluations |
+| `--wind-aligned-episode-zero` | true | Run an additional ideal local-wind benchmark at episode 0. Disable with `--no-wind-aligned-episode-zero`. |
 | `--no-video` | false | Keep numeric evaluation and trajectory logs without MP4 rendering |
 
 `off` produces a constant explicit scenario. `speed` varies speed over time while
@@ -144,8 +145,12 @@ independent of the training profile stream. This makes checkpoint comparisons
 meaningful at one fixed dynamic test condition; it is not a multi-scenario
 generalization test.
 
-The optional reference controller, greedy numeric evaluation, and MP4 reset to
-the exact same scenario object. Under fixed wind the optional reference retains
+Episode 0 uses the untrained greedy actors. The additional `wind_aligned` rollout
+sets each turbine's heading to the current local wind-from direction without a
+yaw-rate limit. It saves `wind_aligned_steps.csv` and supplies the dashed benchmark
+line on both farm-energy plots. Later evaluations use the trained greedy actors.
+Numeric evaluation and MP4 replay the same greedy policy and wind scenario at each
+checkpoint. Under fixed wind the optional reference retains
 the historical initially aligned fixed-heading baseline. With dynamic wind it is
 called `yaw_tracking_baseline` and tracks measured local wind with the same
 yaw-rate limits; it does not anticipate future wind. Enable the extra reference
@@ -169,7 +174,7 @@ those T+1 rows. The numeric and rendered trajectories can be compared directly.
 | `evaluation_wind_scenario.json` | Exact held-out profile reused at checkpoints and by video |
 | `training_metrics.csv` | Per-episode energy, returns, actor/critic errors/clipping, scenario/seed and ending ambient conditions |
 | `rollout_steps.csv` | Every training interval, all agents, rewards/values/advantages plus scenario/seed and interval-end ambient conditions |
-| `evaluation_metrics.csv` | Greedy/reference farm and all individual energies/returns plus scenario ID/seed/count/rating |
+| `evaluation_metrics.csv` | Policy, farm and individual energies/returns, scenario ID, seed, turbine count, and rating |
 | `*_steps.csv` evaluation files | Physical per-tick states matching numeric evaluation or MP4 frames |
 | `models/checkpoint_metadata.json` | Format 6, N, layout, rating, time index, critic input shape and value conventions |
 | `models/actor_agentI.pt` | One actor per turbine |
@@ -238,7 +243,8 @@ obs = env.reset(scenario=scenario)  # env duration must match the recorded durat
 | `shared_critic_runner.py: metric/trace writers, save/restore` | Seed/ambient trace columns and format-6 structural checkpoint validation |
 | `evaluate_wind_farm.py` | N-independent results, physical trajectory snapshots and rate-limited dynamic baseline |
 | `wind_farm_video.py` | Four-agent display, current ambient/scenario label, explicit scenario replay and frame-matching CSV |
-| `plot_training_loss.py`, `plot_training_diagnostics.py` | Discover all actor/critic fields rather than showing only agents 0 and 1 |
+| `plot_training_loss.py` | Greedy evaluation energy for each turbine and shared critic loss |
+| `plot_training_diagnostics.py` | Detects all actor and critic fields in the training logs |
 | `plot_rewards.py`, `plot_training_energy.py` | Recognize dynamic yaw-tracking references in numeric evaluation plots |
 | `plot_evaluation_energy.py` | Derive reward-to-energy normalization from recorded farm rating or agent count; old two-agent configurations imply the original 20 MW rating |
 | `select_team_weight.py` | Preserve all per-turbine results and require matched wind scenario/count across candidate runs |

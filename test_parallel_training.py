@@ -2,6 +2,7 @@
 
 import csv
 from dataclasses import dataclass
+import json
 import multiprocessing as mp
 import os
 from pathlib import Path
@@ -79,6 +80,44 @@ class Farm:
 
 
 class ParallelTrainingTests(unittest.TestCase):
+    def test_partial_final_round_trains_only_on_requested_episodes(self):
+        import torch
+        sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "light_mappo"))
+        from config import get_config
+        from shared_critic_runner import SharedCriticRunner
+
+        torch.set_num_threads(1)
+        args = get_config().parse_args([])
+        args.use_valuenorm = args.use_feature_normalization = False
+        args.episode_length, args.num_env_steps, args.n_rollout_threads = 4, 12, 2
+        args.ppo_epoch, args.numeric_eval_interval = 1, 2
+        evaluations = []
+        with tempfile.TemporaryDirectory() as directory:
+            envs = ProcessVecEnv([FarmFactory(i) for i in range(2)])
+            runner = None
+            try:
+                runner = SharedCriticRunner(dict(all_args=args, envs=envs, eval_envs=None,
+                    num_agents=2, device=torch.device("cpu"), run_dir=Path(directory),
+                    episode_callback=lambda episode, policies: evaluations.append(episode)))
+                runner.run()
+                self.assertEqual(evaluations, [0, 2, 3])
+                self.assertEqual(runner.buffer[0].rewards.shape[:2], (4, 1))
+                with runner.metrics_path.open() as stream:
+                    metrics = list(csv.DictReader(stream))
+                self.assertEqual([int(row["episode"]) for row in metrics], [1, 2, 3])
+                self.assertEqual([int(row["update_round"]) for row in metrics], [1, 1, 2])
+                self.assertEqual([int(row["environment_steps"]) for row in metrics], [4, 8, 12])
+                with runner.rollout_path.open() as stream:
+                    self.assertEqual(len(list(csv.DictReader(stream))), 12)
+                scenarios = [json.loads(line) for line in runner.scenarios_path.read_text().splitlines()]
+                self.assertEqual([(row["training_episode"], row["environment_index"])
+                                  for row in scenarios if row["event"] == "reset"],
+                                 [(1, 0), (2, 1), (3, 0)])
+            finally:
+                envs.close()
+                if runner is not None:
+                    runner.writter.close()
+
     def test_distinct_processes_run_concurrently_and_wait_for_explicit_reset(self):
         import numpy as np
         barrier = mp.get_context("spawn").Barrier(2)

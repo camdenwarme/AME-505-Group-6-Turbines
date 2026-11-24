@@ -111,16 +111,15 @@ class ProcessVecEnv:
     """Windows-safe process environments with a barrier after every step.
 
     Completing an episode leaves the worker idle at its terminal state. The
-    runner updates the policy, then explicitly resets all workers for the next
+    runner updates the policy, then explicitly resets the active workers for the next
     round. The operating system schedules these processes across CPU cores.
     """
 
     def __init__(self, factories, gamma=1.0, threads=1, timeout=600.0):
         if not factories or threads < 1 or timeout <= 0:
             raise ValueError("Use at least one environment, positive threads and timeout.")
-        self.num_envs = len(factories)
         self.timeout = timeout
-        self.connections, self.processes, self.envs = [], [], []
+        self.connections, self.processes, self._snapshots = [], [], []
         self.closed = False
         context = mp.get_context("spawn")
         try:
@@ -137,13 +136,24 @@ class ProcessVecEnv:
                         child.close()
                     self.connections.append(parent)
                     self.processes.append(process)
-            for i in range(self.num_envs):
-                self.envs.append(_Snapshot(**self._receive(i)))
+            for i in range(len(factories)):
+                self._snapshots.append(_Snapshot(**self._receive(i)))
+            self.use_workers(len(factories))
             for name in ("action_space", "observation_space", "share_observation_space"):
                 setattr(self, name, getattr(self.envs[0], name))
         except BaseException:
             self.close()
             raise
+
+    @property
+    def num_envs(self):
+        return len(self.envs)
+
+    def use_workers(self, count):
+        """Select the workers for the next round while retaining all subprocesses."""
+        if not 1 <= count <= len(self._snapshots):
+            raise ValueError("Select at least one available episode worker.")
+        self.envs = self._snapshots[:count]
 
     def _receive(self, index):
         connection, process = self.connections[index], self.processes[index]
@@ -163,7 +173,7 @@ class ProcessVecEnv:
 
     def reset(self):
         import numpy as np
-        for connection in self.connections:
+        for connection in self.connections[:self.num_envs]:
             connection.send(("reset", None))
         results = [self._receive(i) for i in range(self.num_envs)]
         for env, (_, snapshot) in zip(self.envs, results):

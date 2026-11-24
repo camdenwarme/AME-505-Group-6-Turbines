@@ -33,15 +33,18 @@ def read_pilot(directory):
     if not training:
         raise ValueError(f"{directory}: no completed training episodes")
     episode = int(training[-1]["episode"])
-    expected = int(config["num_env_steps"]) // (int(config["episode_length"]) *
-                                                  int(config["n_rollout_threads"]))
+    expected = int(config["num_env_steps"]) // int(config["episode_length"])
     if episode != expected or len(training) != expected:
         raise ValueError(f"{directory}: incomplete training ({episode}/{expected} episodes)")
     greedy = [row for row in evaluations if row.get("policy") == "greedy"]
     before = [row for row in greedy if int(row["episode"]) == 0]
+    if not before:
+        # Older runs could use the wind-aligned policy as the initial evaluation.
+        before = [row for row in evaluations if row.get("policy") == "wind_aligned"
+                  and int(row["episode"]) == 0]
     final = [row for row in greedy if int(row["episode"]) == episode]
     if len(before) != 1 or len(final) != 1:
-        raise ValueError(f"{directory}: require exactly one initial and final greedy evaluation")
+        raise ValueError(f"{directory}: require exactly one initial evaluation and one final greedy evaluation")
     before_scenario, final_scenario = before[0].get("scenario_id", ""), final[0].get("scenario_id", "")
     if before_scenario != final_scenario:
         raise ValueError(f"{directory}: initial and final evaluations used different wind scenarios")
@@ -56,20 +59,25 @@ def read_pilot(directory):
         if len(fields) - 1 != expected_count:
             raise ValueError(f"{directory}: missing per-turbine energy fields")
         return {field: _finite(row.get(field), field, directory) for field in fields}
-    return {"path": str(directory), "config": config, "weight": weight,
-            "seed": int(config["seed"]), "training_episodes": episode,
-            "evaluation_scenario_id": final_scenario,
-            "environment_steps": int(training[-1]["environment_steps"]),
-            "greedy_evaluation_count": len(greedy), "initial_greedy": metrics(before[0]),
-            "final_greedy": metrics(final[0])}
+    initial_policy, initial_evaluation = before[0]["policy"], metrics(before[0])
+    result = {"path": str(directory), "config": config, "weight": weight,
+              "seed": int(config["seed"]), "training_episodes": episode,
+              "evaluation_scenario_id": final_scenario,
+              "environment_steps": int(training[-1]["environment_steps"]),
+              "greedy_evaluation_count": len(greedy), "initial_policy": initial_policy,
+              "initial_evaluation": initial_evaluation, "final_greedy": metrics(final[0])}
+    if initial_policy == "greedy":
+        result["initial_greedy"] = initial_evaluation
+    return result
 
 
 def _config_signature(config, *, across_seeds):
     """Keep all treatment settings, optionally excluding independent RNG seeds."""
-    omitted = {"team_reward_weight", "experiment_name"}
+    omitted = {"team_reward_weight", "experiment_name", "episodes"}
     if across_seeds:
         omitted.update(("seed", "wind_seed", "eval_wind_seed"))
     signature = {key: value for key, value in config.items() if key not in omitted}
+    signature.setdefault("wind_aligned_episode_zero", False)
     if across_seeds:
         for key in ("training_wind_config", "evaluation_wind_config"):
             if isinstance(signature.get(key), dict):
@@ -113,9 +121,10 @@ def select(pilots):
     summaries = []
     for weight, group in sorted(groups.items()):
         runs = [group[seed] for seed in sorted(group)]
+        initial = [run.get("initial_evaluation", run.get("initial_greedy")) for run in runs]
         summaries.append({"weight": weight, "seed_count": len(runs),
                           "seeds": [run["seed"] for run in runs],
-                          "mean_initial_farm_energy_mwh": mean(r["initial_greedy"]["farm_energy_mwh"] for r in runs),
+                          "mean_initial_farm_energy_mwh": mean(metrics["farm_energy_mwh"] for metrics in initial),
                           "mean_final_farm_energy_mwh": mean(r["final_greedy"]["farm_energy_mwh"] for r in runs),
                           "runs": [{k: v for k, v in run.items() if k != "config"} for run in runs]})
     best_energy = max(group["mean_final_farm_energy_mwh"] for group in summaries)

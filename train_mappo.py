@@ -11,13 +11,14 @@ import sys
 ROOT = Path(__file__).resolve().parent
 
 
-def main():
+def main(*, default_layout=None):
+    default_scenario = "square4" if default_layout is None else f"farm_{len(default_layout)}"
     bootstrap = argparse.ArgumentParser(add_help=False)
     bootstrap.add_argument("--mappo-path", type=Path, default=ROOT.parent / "light_mappo")
     bootstrap.add_argument("--wind-speed", type=float, default=8.0)
     bootstrap.add_argument("--wind-direction", type=float, default=270.0)
     bootstrap.add_argument("--layout-file", type=Path, default=None,
-                           help="JSON array of [x,y] or [x,y,z] turbine positions in rotor diameters; default square4.")
+                           help=f"JSON array of [x,y] or [x,y,z] turbine positions in rotor diameters; default {default_scenario}.")
     bootstrap.add_argument("--wind-mode", choices=("off", "speed", "direction", "both"), default="off",
                            help="Toggle seeded, time-varying wind inside every episode.")
     bootstrap.add_argument("--wind-seed", type=int, default=None,
@@ -37,6 +38,8 @@ def main():
                            help="Run numeric evaluations without rendering videos.")
     bootstrap.add_argument("--evaluate-aligned-baseline", action="store_true",
                            help="Also simulate an aligned reference during evaluation.")
+    bootstrap.add_argument("--wind-aligned-episode-zero", action=argparse.BooleanOptionalAction, default=True,
+                           help="Run an additional ideal wind-aligned benchmark at episode 0 (enabled by default).")
     bootstrap.add_argument("--numeric-eval-interval", type=int, default=10,
                            help="Evaluate the greedy policy after this many completed episodes.")
     bootstrap.add_argument("--team-reward-weight", type=float, default=0.5,
@@ -47,6 +50,8 @@ def main():
                            help="Individual weight = (1-beta)**completed_rounds; default 0.05.")
     bootstrap.add_argument("--episode-workers", type=int, default=None,
                            help="Episodes collected in parallel before each update; alias for --n_rollout_threads.")
+    bootstrap.add_argument("--episodes", type=int, default=None,
+                           help="Total training episodes, with a smaller final round if needed. Replaces --num_env_steps.")
     bootstrap.add_argument("--threads-per-worker", type=int, default=1,
                            help="Numerical-library threads in each simulator process.")
     integration, _ = bootstrap.parse_known_args()
@@ -66,8 +71,8 @@ def main():
     from parallel_env import ProcessVecEnv, WindFarmFactory
 
     parser = argparse.ArgumentParser(parents=[bootstrap, get_config()], conflict_handler="resolve")
-    parser.set_defaults(env_name="windfarm", experiment_name="square4",
-                        num_env_steps=20000, episode_length=200, n_rollout_threads=1,
+    parser.set_defaults(env_name="windfarm", experiment_name=default_scenario,
+                        num_env_steps=None, episode_length=200, n_rollout_threads=1,
                         n_eval_rollout_threads=1, gamma=1.0,
                         use_feature_normalization=False, use_valuenorm=False,
                         lr=3.5e-4, critic_lr=3.5e-4,
@@ -84,12 +89,26 @@ def main():
         parser.error("episode-workers and threads-per-worker must be positive.")
     if args.use_eval:
         parser.error("Use --numeric-eval-interval instead of --use_eval.")
-    if args.episode_length < 1 or args.num_env_steps < args.episode_length:
-        parser.error("num_env_steps must cover at least one positive-length episode.")
-    if args.num_env_steps % (args.episode_length * args.n_rollout_threads):
-        parser.error("num_env_steps must be a multiple of episode_length * episode-workers (complete rounds).")
+    if args.episode_length < 1:
+        parser.error("episode_length must be positive.")
+    if args.episodes is not None:
+        if args.num_env_steps is not None:
+            parser.error("Use either --episodes or --num_env_steps.")
+        if args.episodes < 1:
+            parser.error("episodes must be positive.")
+        args.num_env_steps = args.episodes * args.episode_length
+    else:
+        args.num_env_steps = 20000 if args.num_env_steps is None else args.num_env_steps
+        if args.num_env_steps < args.episode_length:
+            parser.error("num_env_steps must cover at least one complete episode.")
+        if args.num_env_steps % (args.episode_length * args.n_rollout_threads):
+            parser.error("num_env_steps must be a multiple of episode_length * episode-workers. Use --episodes for a smaller final round.")
+        args.episodes = args.num_env_steps // args.episode_length
     if args.ppo_epoch < 1 or args.num_mini_batch < 1:
         parser.error("ppo_epoch and num_mini_batch must be positive.")
+    last_round_workers = args.episodes % args.n_rollout_threads or args.n_rollout_threads
+    if args.episode_length * last_round_workers < args.num_mini_batch:
+        parser.error("The last round needs at least one transition per minibatch.")
     if args.video_fps is not None and (not np.isfinite(args.video_fps) or args.video_fps <= 0):
         parser.error("video-fps must be positive.")
     if not np.isfinite(args.team_reward_weight) or not 0 <= args.team_reward_weight <= 1:
@@ -109,7 +128,7 @@ def main():
                              knot_interval_s=args.wind_knot_interval)
         train_wind = WindProfileConfig(seed=args.wind_seed, **wind_settings)
         eval_wind = WindProfileConfig(seed=args.eval_wind_seed, **wind_settings)
-        layout = None if args.layout_file is None else json.loads(args.layout_file.read_text())
+        layout = default_layout if args.layout_file is None else json.loads(args.layout_file.read_text())
         env = WindFarmEnv(args.episode_length, args.dt, args.wind_speed,
                           args.wind_direction, layout=layout, wind_config=train_wind, wind_stream=0)
     except (ValueError, OSError, TypeError) as exc:
@@ -126,8 +145,11 @@ def main():
         parser.error("Use --algorithm_name rmappo with a recurrent-policy flag, or mappo without one.")
     if args.use_recurrent_policy and args.episode_length % args.data_chunk_length:
         parser.error("episode_length must be divisible by data_chunk_length for recurrent training.")
-    if args.use_recurrent_policy and args.episode_length * args.n_rollout_threads // args.data_chunk_length < max(2, args.num_mini_batch):
-        parser.error("Recurrent training needs at least two sequence chunks and one per minibatch.")
+    if args.use_recurrent_policy and args.episode_length * last_round_workers // args.data_chunk_length < max(2, args.num_mini_batch):
+        parser.error("The last recurrent round needs at least two sequence chunks and one per minibatch.")
+    if (args.use_naive_recurrent_policy and not args.use_recurrent_policy
+            and last_round_workers != args.n_rollout_threads and last_round_workers % args.num_mini_batch):
+        parser.error("The last round must divide its episodes evenly among minibatches for naive recurrent training.")
 
     torch.manual_seed(args.seed)
     np.random.seed(args.seed)
@@ -156,11 +178,11 @@ def main():
             wind_config=train_wind, wind_stream=0, environment_id=i), args.seed + i)
             for i in range(args.n_rollout_threads)]
         envs = ProcessVecEnv(factories, gamma=args.gamma, threads=args.threads_per_worker)
-    print(f"Collecting {args.n_rollout_threads} episode(s) per round; "
-          f"{args.ppo_epoch} training pass(es) after each round.", flush=True)
+    print(f"Collecting {args.episodes} episodes with up to {args.n_rollout_threads} per round. "
+          f"Training passes per round: {args.ppo_epoch}.", flush=True)
 
     def record_evaluation(episode, policies):
-        from evaluate_wind_farm import evaluate_episode
+        from evaluate_wind_farm import WIND_ALIGNED_POLICY, evaluate_episode
         # Separate simulator: evaluation must not reset the training environment
         # or invalidate the observations/recurrent states carried in its buffer.
         evaluation_env = WindFarmEnv(args.episode_length, args.dt, args.wind_speed,
@@ -169,23 +191,24 @@ def main():
         try:
             evaluation_env.seed(args.seed)
             # One held-out profile is replayed at every checkpoint and by the
-            # optional baseline/video. Explicit reset does not advance training
+            # benchmarks and video. Explicit reset does not advance training
             # wind counters or draw from policy/global RNGs.
             scenario = evaluation_env.make_scenario(episode_id=0)
             scenario_path = run_dir / "evaluation_wind_scenario.json"
             if not scenario_path.exists():
                 scenario_path.write_text(json.dumps(scenario.to_dict(), indent=2))
-            # A physically simulated aligned benchmark is optional; individual
-            # GAE baseline values are computed analytically without that rollout.
-            records = []
+            records = [{"episode": episode, "policy": "greedy",
+                        **evaluate_episode(evaluation_env, policies, scenario=scenario,
+                          trajectory_path=run_dir / f"evaluation_episode{episode}_steps.csv")}]
+            if episode == 0 and args.wind_aligned_episode_zero:
+                records.append({"episode": episode, "policy": WIND_ALIGNED_POLICY,
+                                **evaluate_episode(evaluation_env, scenario=scenario, wind_aligned=True,
+                                  trajectory_path=run_dir / f"{WIND_ALIGNED_POLICY}_steps.csv")})
             if episode == 0 and args.evaluate_aligned_baseline:
                 kind = "aligned_baseline" if args.wind_mode == "off" else "yaw_tracking_baseline"
                 records.append({"episode": episode, "policy": kind,
                                 **evaluate_episode(evaluation_env, scenario=scenario,
                                   trajectory_path=run_dir / f"{kind}_steps.csv")})
-            records.append({"episode": episode, "policy": "greedy",
-                            **evaluate_episode(evaluation_env, policies, scenario=scenario,
-                              trajectory_path=run_dir / f"evaluation_episode{episode}_steps.csv")})
             path = run_dir / "evaluation_metrics.csv"
             new_file = not path.exists()
             with path.open("a", newline="", encoding="utf-8") as stream:
@@ -214,7 +237,7 @@ def main():
         from plot_training_energy import plot_training_energy
         print(f"Training energy plot: {plot_training_energy(runner.metrics_path)}", flush=True)
         from plot_training_loss import plot_training_loss
-        print(f"Training loss plot: {plot_training_loss(runner.metrics_path)}", flush=True)
+        print(f"Turbine energy and critic loss plot: {plot_training_loss(runner.metrics_path)}", flush=True)
         from plot_rewards import plot_reward_summary
         print(f"Episode reward plot: {plot_reward_summary(run_dir)}", flush=True)
         from plot_training_diagnostics import make_diagnostics

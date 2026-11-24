@@ -18,7 +18,7 @@ def write_training_report(run_dir):
     plots = []
     for filename, title in (
         ("cumulative_energy_by_episode.png", "Energy generation by episode"),
-        ("training_loss_by_episode.png", "Training loss by episode"),
+        ("training_loss_by_episode.png", "Turbine and critic metrics by episode"),
     ):
         # Embed the original PNG bytes: the HTML remains usable when copied
         # independently of the run folder, without needing a server or network.
@@ -65,7 +65,7 @@ def write_evaluation_state_report(run_dir):
                          _plot_image(energy_plot, f"Farm energy history — evaluation episode {episode}"))
         plots.append('</section>')
         sections.append("\n".join(plots))
-    return _write_report(run_dir, "Evaluation states and farm history (greedy policy, no exploration)",
+    return _write_report(run_dir, "Evaluation states and farm history",
                          "evaluation_states.html", sections)
 
 

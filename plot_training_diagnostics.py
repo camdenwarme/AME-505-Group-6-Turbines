@@ -1,4 +1,4 @@
-"""Summarize critic error, PPO clipping, yaw safety, and greedy farm energy."""
+"""Summarize critic error, PPO clipping, yaw safety, and evaluation energy."""
 
 import argparse
 import csv
@@ -100,15 +100,21 @@ def make_diagnostics(run_dir, output_dir=None):
     yaw_lines = [(f"Turbine {i + 1}", colors[j % len(colors)], yaw[j][0])
                  for j, i in enumerate(agent_ids)]
     greedy = _series(evaluation, "farm_energy_mwh", policy="greedy")
+    wind_aligned = _series(evaluation, "farm_energy_mwh", policy="wind_aligned")
     baseline_points = (_series(evaluation, "farm_energy_mwh", policy="aligned_baseline") or
                        _series(evaluation, "farm_energy_mwh", policy="yaw_tracking_baseline"))
     baseline = baseline_points[-1][1] if baseline_points else None
+    references = []
+    if baseline is not None:
+        references.append((baseline, "#536276", evaluation_baseline_label(run_dir)))
+    if wind_aligned:
+        references.append((wind_aligned[-1][1], "#777777", "Wind-aligned benchmark"))
 
     fig = Figure(figsize=(12, 8.4), dpi=140, layout="constrained")
     FigureCanvasAgg(fig)
     axes = fig.subplots(2, 2).reshape(-1)
 
-    def panel(axis, lines, title, ylabel, baseline=None):
+    def panel(axis, lines, title, ylabel, references=()):
         drawn = False
         episodes = []
         for label, color, points in lines:
@@ -118,9 +124,8 @@ def make_diagnostics(run_dir, output_dir=None):
                 axis.plot(xs, ys, marker="o", markersize=3, linewidth=1.3,
                           label=label, color=color)
                 drawn = True
-        if baseline is not None:
-            axis.axhline(baseline, color="#536276", linestyle="--", linewidth=1.2,
-                         label=evaluation_baseline_label(run_dir))
+        for value, color, label in references:
+            axis.axhline(value, color=color, linestyle="--", linewidth=1.2, label=label)
             drawn = True
         axis.set_title(title, loc="left", weight="bold", fontsize=11)
         axis.set_ylabel(ylabel)
@@ -142,7 +147,7 @@ def make_diagnostics(run_dir, output_dir=None):
     axes[1].set_ylim(-0.02, 1.02)
     axes[2].set_ylim(-0.02, 1.02)
     panel(axes[3], [("Greedy evaluation", "#1768ac", greedy)],
-          "Greedy farm energy", "Energy per episode (MWh)", baseline=baseline)
+          "Greedy farm energy", "Energy per episode (MWh)", references=references)
     fig.suptitle("Wind-farm training diagnostics", fontsize=16, weight="bold")
     plot_path = output_dir / "training_diagnostics.png"
     fig.savefig(plot_path)
@@ -157,8 +162,9 @@ def make_diagnostics(run_dir, output_dir=None):
                "ppo_clip_fraction": [_stats(item[2]) for item in clips],
                "yaw_abs_ge_90": [item[1] for item in yaw],
                "greedy_farm_energy_mwh": _stats(greedy),
+               "wind_aligned_farm_energy_mwh": _stats(wind_aligned),
                "aligned_baseline_energy_mwh": baseline,
-               "note": "Critic errors and yaw fractions use exploratory training rollouts; energy uses greedy evaluation."}
+               "note": "Critic errors and yaw fractions use exploratory training rollouts. Energy uses deterministic evaluations."}
     json_path = output_dir / "training_diagnostics.json"
     json_path.write_text(json.dumps(summary, indent=2, allow_nan=False) + "\n", encoding="utf-8")
     return plot_path, json_path

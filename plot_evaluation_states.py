@@ -1,4 +1,4 @@
-"""Plot each turbine's actor observations from an evaluation (greedy policy)."""
+"""Plot each turbine's actor observations from a deterministic evaluation."""
 
 from pathlib import Path
 

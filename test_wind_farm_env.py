@@ -93,6 +93,32 @@ class WindFarmEnvTests(unittest.TestCase):
             env.close()
             other.close()
 
+    def test_wind_aligned_policy_faces_current_local_wind(self):
+        scenario = WindScenario([0, 4, 8], [8, 9, 8], [359, 361, 405], mode="both")
+        env = two_env(episode_length=2)
+        try:
+            obs = env.reset(scenario=scenario, wind_aligned=True)
+            np.testing.assert_allclose(obs[:, 2], 0, atol=1e-8)
+            for _ in range(env.episode_length):
+                previous = obs[:, 1]
+                obs, _, _, infos = env.step()
+                headings = [t.get_yaw_orientation() for t in env.interface.wind_farm.turbines]
+                np.testing.assert_allclose(obs[:, 2], 0, atol=1e-8)
+                np.testing.assert_allclose(headings, obs[:, 1], atol=2e-5, rtol=0)
+                expected = ((obs[:, 1] - previous + 180) % 360 - 180) / env.dt
+                np.testing.assert_allclose([info["yaw_rate_deg_s"] for info in infos], expected, atol=1e-5)
+            self.assertGreater(infos[0]["yaw_rate_deg_s"], 6)
+
+            env.reset(scenario=scenario)
+            obs, _, _, _ = env.step(np.zeros((2, 1)))
+            headings = [t.get_yaw_orientation() for t in env.interface.wind_farm.turbines]
+            np.testing.assert_allclose(headings, 359)
+            expected = (obs[:, 1] - 359 + 180) % 360 - 180
+            np.testing.assert_allclose(obs[:, 2], expected, atol=3e-5)
+            self.assertGreater(float(obs[0, 2]), 1.0)
+        finally:
+            env.close()
+
     def test_configured_wind_changes_aligned_reference(self):
         reference = []
         for speed in (8.0, 10.0):
@@ -256,6 +282,7 @@ class WindFarmEnvTests(unittest.TestCase):
         import pandas as pd
         env = WindFarmEnv.__new__(WindFarmEnv)
         env.num_agents = env.num_agent = 2
+        env.controller = None
         turbines = [SimpleNamespace(get_yaw_orientation=lambda: 270.0) for _ in range(2)]
         env.interface = SimpleNamespace(wind_farm=SimpleNamespace(turbines=turbines))
         env._iterator = iter([(pd.DataFrame({"Power_FLORIS": [1.0, 2.0]}), None,

@@ -1,10 +1,14 @@
 """Numerically evaluate arbitrary-size farms without changing training state."""
 
+from contextlib import contextmanager
 import csv
 from pathlib import Path
 
 import numpy as np
 import torch
+
+
+WIND_ALIGNED_POLICY = "wind_aligned"
 
 
 def scenario_metadata(env):
@@ -55,49 +59,67 @@ def write_evaluation_trajectory(path, rows):
     return path
 
 
-@torch.no_grad()
-def evaluate_episode(env, policies=None, *, scenario=None, trajectory_path=None):
-    """Evaluate a policy or initially aligned fixed headings on one scenario.
-
-    An explicit scenario prevents baseline/policy/video resets from sampling
-    different winds. In dynamic wind modes the baseline tracks measured local
-    wind with the same actuator bounds; fixed wind retains initially aligned
-    headings for compatibility with the historical reference.
-    """
-    modes = [] if policies is None else [p.actor.training for p in policies]
-    count = len(env.action_space)
-    if policies is not None and len(policies) != count:
-        raise ValueError("Expected one policy per turbine.")
-    try:
+@contextmanager
+def evaluation_controls(env, policies, scenario, *, wind_aligned=False):
+    """Reset the simulator and share deterministic controls between CSV and video."""
+    if wind_aligned:
         if policies is not None:
-            for policy in policies:
-                policy.actor.eval()
-            states = [np.zeros((1, p.actor._recurrent_N, p.actor.hidden_size), np.float32)
-                      for p in policies]
+            raise ValueError("The wind-aligned policy cannot be combined with learned policies.")
+        yield env.reset(scenario=scenario, wind_aligned=True), None, WIND_ALIGNED_POLICY
+        return
+
+    if policies is None:
         obs = env.reset() if scenario is None else env.reset(scenario=scenario)
         active_scenario = getattr(env, "current_scenario", getattr(env, "wind_scenario", None))
-        mode = getattr(active_scenario, "mode", "off")
-        if isinstance(active_scenario, dict):
-            mode = active_scenario.get("mode", "off")
-        baseline_kind = "yaw_tracking_baseline" if mode != "off" else "aligned_baseline"
+        mode = (active_scenario.get("mode", "off") if isinstance(active_scenario, dict)
+                else getattr(active_scenario, "mode", "off"))
+
+        def baseline_actions(obs):
+            actions = np.zeros((len(env.action_space), 1), dtype=np.float32)
+            if mode != "off":
+                actions[:, 0] = obs[:, 2] / env.dt
+                for i, space in enumerate(env.action_space):
+                    actions[i] = np.clip(actions[i], space.low, space.high)
+            return actions
+
+        kind = "aligned_baseline" if mode == "off" else "yaw_tracking_baseline"
+        yield obs, baseline_actions, kind
+        return
+
+    if len(policies) != len(env.action_space):
+        raise ValueError("Expected one policy per turbine.")
+    modes = [p.actor.training for p in policies]
+    try:
+        for policy in policies:
+            policy.actor.eval()
+        states = [np.zeros((1, p.actor._recurrent_N, p.actor.hidden_size), np.float32)
+                  for p in policies]
+        mask = np.ones((1, 1), np.float32)
+
+        def greedy_actions(obs):
+            actions = []
+            for i, policy in enumerate(policies):
+                action, states[i] = policy.act(obs[i:i + 1], states[i], mask, deterministic=True)
+                actions.append(action.detach().cpu().numpy()[0])
+            return np.stack(actions)
+
+        obs = env.reset() if scenario is None else env.reset(scenario=scenario)
+        yield obs, greedy_actions, "greedy"
+    finally:
+        for policy, mode in zip(policies, modes):
+            policy.actor.train(mode)
+
+
+@torch.no_grad()
+def evaluate_episode(env, policies=None, *, scenario=None, trajectory_path=None, wind_aligned=False):
+    """Evaluate deterministic controls on one replayable wind scenario."""
+    count = len(env.action_space)
+    with evaluation_controls(env, policies, scenario, wind_aligned=wind_aligned) as (obs, control, kind):
         team_return = 0.0
         individual_returns = np.zeros(count, dtype=float)
-        mask = np.ones((1, 1), np.float32)
         snapshots = [evaluation_snapshot(env, obs, 0, np.zeros(count))] if trajectory_path else []
         for tick in range(1, env.episode_length + 1):
-            if policies is None:
-                actions = np.zeros((count, 1), dtype=np.float32)
-                if mode != "off":
-                    actions[:, 0] = obs[:, 2] / env.dt
-                    for i, space in enumerate(env.action_space):
-                        actions[i] = np.clip(actions[i], space.low, space.high)
-            else:
-                actions = []
-                for i, policy in enumerate(policies):
-                    action, states[i] = policy.act(obs[i:i + 1], states[i], mask,
-                                                   deterministic=True)
-                    actions.append(action.detach().cpu().numpy()[0])
-                actions = np.stack(actions)
+            actions = None if control is None else control(obs)
             obs, rewards, dones, infos = env.step(actions)
             team_return += float(infos[0]["team_reward"])
             individual_returns += rewards[:, 0]
@@ -110,7 +132,7 @@ def evaluate_episode(env, policies=None, *, scenario=None, trajectory_path=None)
             write_evaluation_trajectory(trajectory_path, snapshots)
         metadata = scenario_metadata(env)
         result = {"scenario_id": metadata["scenario_id"],
-                  "baseline_kind": baseline_kind if policies is None else "",
+                  "baseline_kind": kind if policies is None and not wind_aligned else "",
                   "wind_episode_id": metadata["episode_id"],
                   "wind_episode_seed": metadata["episode_seed"],
                   "num_agents": count,
@@ -122,7 +144,3 @@ def evaluate_episode(env, policies=None, *, scenario=None, trajectory_path=None)
             result[f"turbine{i}_energy_mwh"] = float(infos[i]["turbine_episode_energy_j"]) / 3.6e9
             result[f"turbine{i}_return"] = float(individual_returns[i])
         return result
-    finally:
-        if policies is not None:
-            for policy, mode in zip(policies, modes):
-                policy.actor.train(mode)

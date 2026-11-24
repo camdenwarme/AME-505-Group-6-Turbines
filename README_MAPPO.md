@@ -46,10 +46,13 @@ for the next round. Simulator processes persist across rounds.
 `--ppo_epoch` independently controls the training passes over each round's data.
 For example, `--ppo_epoch 10` uses the same collection barriers, followed by ten
 training passes. Minibatching can produce multiple optimizer steps within a pass.
-`--num_env_steps` counts transitions across all workers and must be divisible by
-`episode_length * episode-workers`; incomplete rounds are rejected rather than
-silently discarded. Evaluation occurs after completed rounds when an episode
-interval is crossed, plus before training and after the final round.
+Use `--episodes` to set the total number of training episodes directly.
+`--episode-workers 4 --episodes 22` collects five rounds of four episodes and
+one final round of two. Each episode still runs for `--episode_length` steps.
+Use either `--episodes` or `--num_env_steps`. The step-budget flag counts all
+worker transitions and requires a multiple of `episode_length * episode-workers`.
+Evaluation runs before training, after a round crosses an evaluation interval,
+and after the final round. Evaluation rollouts are counted separately.
 
 `--threads-per-worker` defaults to one to avoid nested numerical-library thread
 pools. Windows schedules the separate processes across available CPU cores;
@@ -83,6 +86,16 @@ adjacent turbines. Agent indices 0/1 are the first column, and 2/3 the second.
 in rotor diameters. Agent count, farm bounds, array sizes, centralized features,
 and rated power derive from the layout; all turbines currently use the case's
 same 10MW type. With N turbines the normalized farm rating is N*10MW.
+
+The layout-specific launchers accept the same training flags as `train_mappo.py`.
+The four-turbine launcher uses the default square. The six-turbine launcher uses
+the OFF/FLORIS layout with two rows of three turbines at 5D spacing. Both presets
+are built into the launchers and can be overridden with `--layout-file`.
+
+```powershell
+python train_mappo_4_turbines.py --episodes 22 --no-video
+python train_mappo_6_turbines.py --episodes 22 --no-video
+```
 
 Wind is fixed at 8 m/s from 270 degrees by default. `--wind-speed` and
 `--wind-direction` set these base conditions (meteorological **from** degrees).
@@ -322,7 +335,7 @@ CSV and from cumulative training energy. Elapsed wall time includes evaluations.
 
 At the end of a successful run, `cumulative_energy_by_episode.png` is saved next
 to the CSV. It plots training episode energy from `episode_energy_mwh`, numeric
-greedy evaluation energy from `evaluation_metrics.csv`, and the simulated aligned
+evaluation energy from `evaluation_metrics.csv`, and the simulated aligned
 baseline if present. Energy resets at the start of every episode; the plot does
 not sum energy across training episodes. Its tightly fitted y-axis includes all
 visible series and the baseline, with 12% padding around the observed range and
@@ -330,26 +343,37 @@ a fallback for constant or single-episode data.
 Regenerate the plot for an existing CSV using:
 `python plot_training_energy.py <run-folder>`.
 
-The run also saves `training_loss_by_episode.png`, with separate panels for
-each turbine's actor policy loss and the shared critic's value loss. Each panel
-has an independently fitted y-axis with 12%
-padding so losses on different scales remain readable. Points are episode-level
-averages over PPO epochs/minibatches, as recorded in the CSV. Actor losses may be
-negative and exclude the entropy bonus. Regenerate this plot using:
+The run also saves `training_loss_by_episode.png`, with a greedy evaluation
+energy panel for each turbine and a shared critic value-loss panel. The turbine
+panels show MWh above or below the wind-aligned benchmark when it uses the same
+wind scenario. In that case, the dashed zero line marks the benchmark. With no
+matching benchmark, the panel shows absolute MWh. Actor losses remain recorded
+in `training_metrics.csv`. Regenerate this plot using:
 `python plot_training_loss.py <run-folder>`.
 
 After generating both plots, the run saves `training_plots.html`. Open it in a
-browser to see the energy plot above the training-loss plot, each with its original
+browser to see the farm energy plot above the turbine and critic panels, each with its original
 aspect ratio preserved at any window width. The PNGs are embedded unchanged, so
 this single HTML file works offline and can be copied without its run folder.
 Regenerate it for a folder that already contains both plots using:
 `python training_report.py <run-folder>`.
 
-Before training (`episode0`), every `--numeric-eval-interval` completed training
-episodes (default 10), and after the final episode, an evaluation episode runs
-using the actors' greedy policy (the `tanh`-transformed Gaussian mean), with no
-exploration or learning. `evaluation_metrics.csv` records farm and per-turbine
-energy and returns with the agent count, farm rating, and wind-scenario identifiers.
+Evaluation episode 0 uses the untrained actors' greedy policy. The same
+deterministic action rule (the `tanh`-transformed Gaussian mean) evaluates the
+actors after every `--numeric-eval-interval` completed episodes (default 10) and
+at the final episode.
+
+By default, episode 0 also runs an ideal wind-aligned benchmark on the same wind
+profile. At each tick it points every turbine into its measured local wind for
+0° relative yaw without the usual 6°/s limit. OFF samples inflow with the rotor
+in its ambient-aligned position and uses zero yaw loss for the power calculation.
+The controller sets the local-wind heading and records it for wake propagation.
+Pass `--no-wind-aligned-episode-zero` to omit the benchmark or
+`--wind-aligned-episode-zero` to enable it explicitly.
+
+`evaluation_metrics.csv` records the policy (`wind_aligned` or `greedy`), farm
+and per-turbine energies and returns, and wind-scenario identifiers.
+The benchmark's per-tick trajectory is saved to `wind_aligned_steps.csv`.
 The evaluation profile is generated once using the evaluation seed and stream 1,
 saved in `evaluation_wind_scenario.json`, and replayed unchanged at every
 checkpoint. Numeric evaluations, the optional baseline, and videos explicitly
@@ -371,6 +395,7 @@ initial state: actual turbine positions/headings, actor observations, commanded
 and applied rates, turbine/farm power, energy, and ambient wind. The video saves
 `wind_farm_episodeN_steps.csv` from its own rendered rollout, so frame k can be
 checked directly against tick k. Both contain scenario ID and seed metadata.
+For the wind-aligned policy, rates describe the heading change over each tick.
 
 Videos use the number of completed training episodes:
 `wind_farm_episode0.mp4`, `wind_farm_episode10.mp4`, etc. The default
@@ -424,10 +449,11 @@ than assuming two turbines. New evaluations record simulator energy directly.
 Training CSV rows record `episode_return` (the sum of team rewards within that
 episode), `episode_end_reward` (its final team reward), and each actor's
 individual return. When training finishes, `reward_by_episode.png` plots team
-episode reward against episode number, with an automatically fitted y-axis.
-Training and greedy numeric evaluations are separate labeled series whether or
-not videos are enabled; an aligned baseline is included when recorded. Both
-energy and reward plots prefer numeric evaluation CSV values and use legacy
+episode reward for training and greedy evaluation, with an automatically fitted y-axis.
+The **Farm energy within each episode** plot and **Greedy farm energy** subplot
+show the wind-aligned benchmark's final energy as a labeled dashed grey line.
+The optional aligned baseline also appears when recorded. The energy and reward
+summaries prefer numeric evaluation CSV values and use legacy
 video NPZ histories only for episodes missing from the CSV, avoiding duplicate
 points. This compares all recorded episodes within the current run, not a running
 sum across episodes or across different run folders. The summary is embedded in both
@@ -447,10 +473,9 @@ full farm rated-power range. Y-axis labels remain absolute MW values without an 
 Default playback is 10x simulation speed, one frame per control step:
 each frame lasts `dt / 10` seconds. With a 4 s step this is 0.4 s per frame
 (2.5 FPS). A 200-step episode produces about 80 seconds of video. Use
-`--video-fps` to explicitly override this rate. These are separate evaluation
-episodes using a greedy policy, not recordings of the exploratory training episodes. Each
-uses the same duration and configured wind distribution as training, with the
-explicit held-out evaluation profile rather than an exploratory training profile.
+`--video-fps` to explicitly override this rate. Videos replay the policy used for
+the numeric evaluation at each checkpoint with the same duration and held-out
+wind profile.
 
 `rollout_steps.csv` records every exploratory training transition, one row per
 zero-based tick and environment, after each completed rollout. `episode` is
@@ -494,9 +519,9 @@ Training also writes these diagnostics automatically after a successful run.
 The command writes `training_diagnostics.png` and `training_diagnostics.json` beside
 the run logs. Panels show team and individual critic return RMSE, PPO clip
 fractions, each turbine's fraction of exploratory yaw samples at |yaw| ≥ 90°,
-and greedy farm energy with the aligned baseline if recorded. Missing or
+and evaluation farm energy with the aligned benchmark if recorded. Missing or
 nonfinite samples are omitted. Critic and yaw data describe exploratory training
-rollouts; greedy energy comes from separate evaluation episodes.
+rollouts. Evaluation energy comes from deterministic policy rollouts.
 
 To screen farm-advantage weights, run matched pilots with the same environment,
 seed, rollout length and optimizer settings, use `--advantage-weight-schedule constant`,
@@ -508,7 +533,7 @@ then pass their completed run folders to:
 .venv/Scripts/python.exe select_team_weight.py <run-weight-0> <run-weight-0.5> <run-weight-1> --output weight_selection.json
 ```
 
-The selection utility requires an initial and final greedy evaluation and
+The selection utility requires an initial evaluation and a final greedy evaluation, plus
 complete training metrics for each candidate. It checks that configurations
 match aside from weight, seed and experiment label; for multiple seeds, each
 candidate must use the same seed set. It selects the highest mean final greedy
