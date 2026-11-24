@@ -142,6 +142,21 @@ class SharedCriticRunner(SeparatedRunner):
         self.model_dir = model_dir
         for i, policy in enumerate(self.policy):
             install_bounded_action_head(policy, self.envs.action_space[i])
+        # Optional neighbour-graph encoder (--graph-layer on). Each turbine keeps
+        # its own actor, so each gets its own encoder. Critics are unchanged.
+        graphs = {id(getattr(env, "graph", None)): getattr(env, "graph", None) for env in self.envs.envs}
+        if len(graphs) != 1 and None in graphs.values():
+            raise ValueError("Either every rollout environment uses the neighbour graph or none does.")
+        self.graph = next(iter(graphs.values()))
+        self.graph_settings = None
+        if self.graph is not None:
+            from graph_actor import install_graph_actor
+            self.graph_settings = {"hidden": int(getattr(args, "graph_hidden", 64)),
+                                   "heads": int(getattr(args, "graph_heads", 4)),
+                                   "layers": int(getattr(args, "graph_layers", None) or self.graph.hops)}
+            for policy in self.policy:
+                install_graph_actor(policy, self.graph.spec, args, self.graph_settings["hidden"],
+                                    self.graph_settings["heads"], self.graph_settings["layers"])
         self._episode_callback = config.get("episode_callback")
         self._completed_episodes = 0
         self._episode_energy_j = None
@@ -414,7 +429,7 @@ class SharedCriticRunner(SeparatedRunner):
                            "team_gae_advantage": team_advantage[step, env_index, 0]}
                     row.update(self._rollout_conditions[step][env_index])
                     for i, buffer in enumerate(self.buffer):
-                        speed, direction, yaw = buffer.obs[step, env_index]
+                        speed, direction, yaw = buffer.obs[step, env_index][:3]
                         mixed = mixed_advantages[i]
                         values = (speed, direction, yaw, buffer.actions[step, env_index, 0],
                                   *self._rollout_physical[step, env_index, i],
@@ -587,7 +602,7 @@ class SharedCriticRunner(SeparatedRunner):
     def _checkpoint_metadata(self):
         env = self.envs.envs[0]
         layout = getattr(env, "layout_d", None)
-        return {
+        metadata = {
             "format_version": 6, "num_agents": self.num_agents,
             "action_head": "tanh_squashed_gaussian",
             "critic_observation_shape": list(self.envs.share_observation_space[0].shape),
@@ -597,6 +612,10 @@ class SharedCriticRunner(SeparatedRunner):
             "individual_value": "aligned_reference_plus_discounted_remaining_horizon_residual",
             "team_value": "discounted_remaining_horizon_times_per_step_value",
         }
+        # Only graph checkpoints carry this key, so graph-off checkpoints are unchanged.
+        if self.graph is not None:
+            metadata["actor_graph"] = {**self.graph.describe(), **self.graph_settings}
+        return metadata
 
     def save(self, directory=None):
         # Default: the rolling checkpoint light_mappo overwrites every episode.
@@ -619,6 +638,8 @@ class SharedCriticRunner(SeparatedRunner):
             raise ValueError("Checkpoint predates the bounded action head and expanded critic state; start a new run.")
         metadata = json.loads(metadata_path.read_text())
         expected = self._checkpoint_metadata()
+        if "actor_graph" in metadata and "actor_graph" not in expected:
+            raise ValueError("Checkpoint actors use the neighbour graph; rerun with --graph-layer on and the same layout file.")
         if any(metadata.get(key) != value for key, value in expected.items()):
             raise ValueError("Incompatible checkpoint; format 6 requires matching agent count, layout, ratings and critic schema.")
         if not (directory / "critic.pt").is_file():

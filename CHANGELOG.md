@@ -1,5 +1,19 @@
 # Changelog
 
+## 2026-11-24: Optional neighbour graph layer for the actors (`--graph-layer`)
+
+`--graph-layer on` puts a graph-attention encoder in front of each turbine's
+actor MLP. The encoder works on a fixed neighbour graph read from a layout file,
+and its edge features (downstream distance, crosswind offset, wake proxy) are
+recomputed in the wind frame every step. Actors stay separate per turbine, and
+the farm critic and per-turbine value models are unchanged. The default, `off`,
+reproduces the previous code value for value. The new layout file format lists
+turbine coordinates and neighbour links, and any turbine count works.
+`turbine_graph.py make/check` generates and validates these files. See
+[README_GRAPH_LAYER.md](README_GRAPH_LAYER.md) for usage, design reasoning (from
+scratch rather than InforMARL), exact changes and verification. No performance
+comparison has been run yet.
+
 ## 2026-11-15: Multi-episode PPO batches (`--episodes-per-update`)
 
 ### Personal Note

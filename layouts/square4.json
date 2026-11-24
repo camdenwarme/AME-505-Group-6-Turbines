@@ -1,0 +1,15 @@
+{
+  "description": "Default 2 x 2 square, 5 D spacing (train_mappo.py default layout)",
+  "turbines": [
+    {"name": "T1", "x": 0, "y": 0},
+    {"name": "T2", "x": 0, "y": 5},
+    {"name": "T3", "x": 5, "y": 0},
+    {"name": "T4", "x": 5, "y": 5}
+  ],
+  "neighbors": [
+    ["T1", "T2"],
+    ["T1", "T3"],
+    ["T2", "T4"],
+    ["T3", "T4"]
+  ]
+}

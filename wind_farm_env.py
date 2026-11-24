@@ -59,7 +59,7 @@ class WindFarmEnv:
 
     def __init__(self, episode_length=200, dt=4.0, wind_speed=8.0,
                  wind_direction=270.0, layout=None, wind_config=None,
-                 wind_stream=0, environment_id=0):
+                 wind_stream=0, environment_id=0, graph=None):
         if (not np.isfinite([dt, wind_speed, wind_direction]).all()
                 or dt <= 0 or wind_speed <= 0
                 or episode_length < 1 or int(episode_length) != episode_length):
@@ -97,6 +97,17 @@ class WindFarmEnv:
         self.observation_space = [
             spaces.Box(np.array([0, 0, -180], np.float32),
                        np.array([np.inf, 360, 180], np.float32)) for _ in range(self.num_agents)]
+        # Optional neighbour graph (turbine_graph.TurbineGraph). None keeps the
+        # original 3-value actor observation; the critic inputs never change.
+        self.graph = graph
+        if graph is not None:
+            if graph.num_turbines != self.num_agents or not np.allclose(
+                    graph.positions_d[:, :2], self.layout_d[:, :2]):
+                raise ValueError("The neighbour graph must use the same turbines, in the same order, as the layout.")
+            low = np.full(graph.spec.size, -np.inf, np.float32)
+            high = np.full(graph.spec.size, np.inf, np.float32)
+            low[:3], high[:3] = (0, 0, -180), (np.inf, 360, 180)
+            self.observation_space = [spaces.Box(low, high) for _ in range(self.num_agents)]
         central_size = self.num_agents * (4 + len(self.critic_yaw_history_lags)) + 1
         self.share_observation_space = [spaces.Box(-np.inf, np.inf, (central_size,),
                                                     dtype=np.float32) for _ in range(self.num_agents)]
@@ -213,7 +224,7 @@ class WindFarmEnv:
                 obs, self._power = self._measure()
                 self._previous_turbine_power = self._turbine_power.copy()
                 self._obs = obs.copy()
-            return obs
+            return self._actor_obs(obs)
         except BaseException:
             self._handlers = [h for h in logger.handlers if h not in previous_handlers]
             self.close()
@@ -221,6 +232,13 @@ class WindFarmEnv:
         finally:
             if self.interface is not None:
                 self._handlers = [h for h in logger.handlers if h not in previous_handlers]
+
+    def _actor_obs(self, obs):
+        """Actor input: local measurements, plus the neighbour graph when enabled.
+
+        The first three columns are always the local [speed, direction, yaw].
+        """
+        return obs if self.graph is None else self.graph.observe(obs)
 
     def _measure(self):
         measurements, _, velocity = next(self._iterator)
@@ -333,7 +351,7 @@ class WindFarmEnv:
                  for i in range(self.num_agents)]
         if done:
             infos[0]["wind_scenario"] = self.wind_scenario.to_dict()
-        return obs, rewards, np.full(self.num_agents, done, dtype=bool), infos
+        return self._actor_obs(obs), rewards, np.full(self.num_agents, done, dtype=bool), infos
 
     def close(self):
         if self._iterator is not None:

@@ -157,7 +157,8 @@ def record_policy_video(env, policies, output_path, fps=None, episode=None, *, s
         if len(policies) != len(env.action_space):
             raise ValueError("Expected one policy per turbine.")
         obs = env.reset() if scenario is None else env.reset(scenario=scenario)
-        observations = [obs.copy()]
+        # Local [speed, direction, yaw] only; graph observations append more columns.
+        observations = [obs[:, :3].copy()]
         states = [np.zeros((1, policy.actor._recurrent_N, policy.actor.hidden_size), np.float32)
                   for policy in policies]
         mask = np.ones((1, 1), np.float32)
@@ -179,7 +180,7 @@ def record_policy_video(env, policies, output_path, fps=None, episode=None, *, s
                 # labeled as farm reward must use the separately reported team value.
                 reward_history.append(float(infos[0]["team_reward"]))
                 energy_history.append(float(infos[0]["episode_energy_j"]))
-                observations.append(obs.copy())
+                observations.append(obs[:, :3].copy())
                 times.append((step + 1) * env.dt)
                 powers.append(infos[0]["farm_power_w"])
                 rates = [item["yaw_rate_deg_s"] for item in infos]

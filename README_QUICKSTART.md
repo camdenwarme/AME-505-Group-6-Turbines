@@ -3,7 +3,7 @@
 This is the condensed version of setup, checks, and training commands. For the
 full design, see [README_MAPPO.md](README_MAPPO.md) (how the MAPPO setup works)
 and [README_FOUR_TURBINES_DYNAMIC_WIND.md](README_FOUR_TURBINES_DYNAMIC_WIND.md)
-(four-turbine layout and dynamic wind). Commands below are for Windows PowerShell,
+(four-turbine layout and dynamic wind), and [README_GRAPH_LAYER.md](README_GRAPH_LAYER.md) (optional neighbour graph layer and layout files). Commands below are for Windows PowerShell,
 run from the repository folder. On macOS/Linux, replace `.venv/Scripts/python.exe`
 with `.venv/bin/python`.
 
@@ -52,7 +52,7 @@ Run these in order. Each one should match the expected result.
 | # | Command | Expected result |
 |---|---------|-----------------|
 | 1 | `.venv/Scripts/python.exe -c "import floris, torch, gym; print(torch.__version__)"` | A version string. A Gym "please upgrade to Gymnasium" notice is harmless. |
-| 2 | `.venv/Scripts/python.exe -m unittest discover -v` | `Ran 44 tests ... OK` (about 40 s) |
+| 2 | `.venv/Scripts/python.exe -m unittest discover -v` | `Ran 56 tests ... OK` (about 60 s) |
 | 3 | `.venv/Scripts/python.exe train_mappo.py --num_env_steps 8 --episode_length 4 --ppo_epoch 1 --no-video --experiment_name smoke` | `Evaluation episode 0 greedy: ... MWh`, then `Evaluation episode 2 ...`, then `Checkpoints and logs: ...` (about 20 s) |
 | 4 | `.venv/Scripts/python.exe train_mappo.py --num_env_steps 8 --episode_length 4 --ppo_epoch 1 --wind-mode both --wind-knot-interval 4 --evaluate-aligned-baseline --experiment_name smoke_video` | Same as step 3, plus a `yaw_tracking_baseline` line and `wind_farm_episode0.mp4` / `wind_farm_episode2.mp4` (about 30 s) |
 
