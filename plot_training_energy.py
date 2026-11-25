@@ -8,7 +8,7 @@ from matplotlib.backends.backend_agg import FigureCanvasAgg
 from matplotlib.figure import Figure
 from matplotlib.ticker import MaxNLocator
 import numpy as np
-from plot_rewards import evaluation_series, evaluation_baseline_label
+from plot_rewards import draw_wind_aligned, evaluation_series, evaluation_baseline_label
 
 
 def plot_training_energy(metrics_path):
@@ -41,6 +41,7 @@ def plot_training_energy(metrics_path):
         axis.axhline(baseline, color="#536276", linestyle="--", linewidth=1.2,
                      label=evaluation_baseline_label(metrics_path.parent))
         values.append(baseline)
+    draw_wind_aligned(axis, metrics_path.parent, "farm_energy_mwh", values)
     axis.set_title("Farm energy within each episode", loc="left",
                    fontsize=12, weight="bold")
     axis.set_ylabel("Energy captured at episode end (MWh)")

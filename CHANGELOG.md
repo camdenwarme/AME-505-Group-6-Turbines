@@ -13,7 +13,9 @@ dynamic wind it matches the existing `yaw_tracking_baseline`. With constant
 wind (`--wind-mode off`) it still tracks local inflow, where the old aligned
 baseline holds its initial headings. Training is unaffected: training,
 rollout and greedy-evaluation CSVs were unchanged in a seeded check. The
-charts do not draw this benchmark yet.
+energy, reward, diagnostics and per-turbine charts draw it as a gray
+dash-dot "Wind-aligned benchmark (±6°/s)" reference line, and
+`training_diagnostics.json` records it as `wind_aligned_energy_mwh`.
 
 ## 2026-11-24: Optional neighbour graph layer for the actors (`--graph-layer`)
 

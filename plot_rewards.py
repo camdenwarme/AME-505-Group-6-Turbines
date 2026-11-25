@@ -10,6 +10,10 @@ from matplotlib.figure import Figure
 from matplotlib.ticker import MaxNLocator
 import numpy as np
 
+from plot_style import WIND_ALIGNED_STYLE
+
+WIND_ALIGNED_POLICY = "wind_aligned"   # same name as evaluate_wind_farm.WIND_ALIGNED_POLICY
+
 
 def _style(axis, values):
     low, high = float(np.min(values)), float(np.max(values))
@@ -59,6 +63,30 @@ def evaluation_series(run_dir, field):
             value = float(values.sum() if field == "team_return" else values[-1] / 3.6e9)
         greedy[int(match[1])] = value
     return sorted(greedy.items()), baseline
+
+
+def wind_aligned_reference(run_dir, field):
+    """Latest wind-aligned benchmark value for field, or None if not recorded."""
+    path = Path(run_dir) / "evaluation_metrics.csv"
+    value = None
+    if path.exists():
+        with path.open(newline="", encoding="utf-8") as stream:
+            for row in csv.DictReader(stream):
+                if row.get("policy") == WIND_ALIGNED_POLICY and row.get(field):
+                    value = float(row[field])
+    if value is not None and not np.isfinite(value):
+        raise ValueError(f"Nonfinite wind-aligned {field} in {path}")
+    return value
+
+
+def draw_wind_aligned(axis, run_dir, field, values=None):
+    """Draw the wind-aligned reference line if recorded; extend values for axis limits."""
+    value = wind_aligned_reference(run_dir, field)
+    if value is not None:
+        axis.axhline(value, **WIND_ALIGNED_STYLE)
+        if values is not None:
+            values.append(value)
+    return value
 
 
 def evaluation_baseline_label(run_dir):
@@ -112,7 +140,7 @@ def plot_reward_summary(run_dir):
     if evaluations:
         episodes, returns = zip(*sorted(evaluations))
         series.append(("Evaluation (greedy policy)", "#b76a12", episodes, returns))
-    if not series and baseline is None:
+    if not series and baseline is None and wind_aligned_reference(run_dir, "team_return") is None:
         raise ValueError("No recorded episode reward data are available to plot.")
     fig = Figure(figsize=(10, 4.5), dpi=160, layout="constrained")
     FigureCanvasAgg(fig)
@@ -125,6 +153,7 @@ def plot_reward_summary(run_dir):
         axis.axhline(baseline, color="#536276", linestyle="--", linewidth=1.2,
                      label=evaluation_baseline_label(run_dir))
         all_values.append(baseline)
+    draw_wind_aligned(axis, run_dir, "team_return", all_values)
     _style(axis, all_values)
     axis.set_title("Total reward earned within each episode", loc="left", fontsize=12, weight="bold")
     axis.set_ylabel("Episode return (sum of rewards)")

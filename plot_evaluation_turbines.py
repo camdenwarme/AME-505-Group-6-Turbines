@@ -21,7 +21,8 @@ from matplotlib.backends.backend_agg import FigureCanvasAgg
 from matplotlib.figure import Figure
 from matplotlib.ticker import MaxNLocator
 
-from plot_style import (BASELINE_COLOR, FARM_COLOR, TEXT_SECONDARY, ZERO_LINE_COLOR,
+from plot_rewards import wind_aligned_reference
+from plot_style import (WIND_ALIGNED_STYLE, BASELINE_COLOR, FARM_COLOR, TEXT_SECONDARY, ZERO_LINE_COLOR,
                         turbine_color, turbine_marker)
 
 BASELINE_POLICIES = ("aligned_baseline", "yaw_tracking_baseline")
@@ -101,11 +102,16 @@ def plot_evaluation_turbines(run_dir):
     if baseline is not None:
         energy_axis.axhline(_float(baseline["farm_energy_mwh"]), color=BASELINE_COLOR,
                             linestyle="--", linewidth=1.3, label=reference_name.capitalize())
+    wind_aligned = wind_aligned_reference(run_dir, "farm_energy_mwh")
+    if wind_aligned is not None:
+        energy_axis.axhline(wind_aligned, **WIND_ALIGNED_STYLE)
     best = max(range(len(farm)), key=lambda i: -math.inf if math.isnan(farm[i]) else farm[i])
     best_text = f"Best: episode {episodes[best]}, {farm[best]:.3f} MWh"
     if baseline is not None:
         base_energy = _float(baseline["farm_energy_mwh"])
         best_text += f" ({100 * (farm[best] / base_energy - 1):+.1f}% vs baseline)"
+    if wind_aligned is not None:
+        best_text += f" ({100 * (farm[best] / wind_aligned - 1):+.1f}% vs wind-aligned)"
     energy_axis.plot([episodes[best]], [farm[best]], marker="o", markersize=12, markerfacecolor="none",
                      markeredgecolor=FARM_COLOR, markeredgewidth=1.5, linestyle="none")
     energy_axis.annotate(best_text, xy=(episodes[best], farm[best]), xytext=(0, 12),

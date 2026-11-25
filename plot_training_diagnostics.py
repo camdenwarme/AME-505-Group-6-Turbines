@@ -10,7 +10,7 @@ import re
 from matplotlib.backends.backend_agg import FigureCanvasAgg
 from matplotlib.figure import Figure
 from matplotlib.ticker import MaxNLocator
-from plot_rewards import evaluation_baseline_label
+from plot_rewards import draw_wind_aligned, evaluation_baseline_label, wind_aligned_reference
 from plot_style import FARM_COLOR, TURBINE_COLORS
 
 
@@ -104,12 +104,13 @@ def make_diagnostics(run_dir, output_dir=None):
     baseline_points = (_series(evaluation, "farm_energy_mwh", policy="aligned_baseline") or
                        _series(evaluation, "farm_energy_mwh", policy="yaw_tracking_baseline"))
     baseline = baseline_points[-1][1] if baseline_points else None
+    wind_aligned = wind_aligned_reference(run_dir, "farm_energy_mwh")
 
     fig = Figure(figsize=(12, 8.4), dpi=140, layout="constrained")
     FigureCanvasAgg(fig)
     axes = fig.subplots(2, 2).reshape(-1)
 
-    def panel(axis, lines, title, ylabel, baseline=None):
+    def panel(axis, lines, title, ylabel, baseline=None, references=False):
         drawn = False
         episodes = []
         for label, color, points in lines:
@@ -122,6 +123,8 @@ def make_diagnostics(run_dir, output_dir=None):
         if baseline is not None:
             axis.axhline(baseline, color="#536276", linestyle="--", linewidth=1.2,
                          label=evaluation_baseline_label(run_dir))
+            drawn = True
+        if references and draw_wind_aligned(axis, run_dir, "farm_energy_mwh") is not None:
             drawn = True
         axis.set_title(title, loc="left", weight="bold", fontsize=11)
         axis.set_ylabel(ylabel)
@@ -143,7 +146,8 @@ def make_diagnostics(run_dir, output_dir=None):
     axes[1].set_ylim(-0.02, 1.02)
     axes[2].set_ylim(-0.02, 1.02)
     panel(axes[3], [("Greedy evaluation", "#1768ac", greedy)],
-          "Greedy farm energy", "Energy per episode (MWh)", baseline=baseline)
+          "Greedy farm energy", "Energy per episode (MWh)", baseline=baseline,
+          references=True)
     fig.suptitle("Wind-farm training diagnostics", fontsize=16, weight="bold")
     plot_path = output_dir / "training_diagnostics.png"
     fig.savefig(plot_path)
@@ -159,6 +163,7 @@ def make_diagnostics(run_dir, output_dir=None):
                "yaw_abs_ge_90": [item[1] for item in yaw],
                "greedy_farm_energy_mwh": _stats(greedy),
                "aligned_baseline_energy_mwh": baseline,
+               "wind_aligned_energy_mwh": wind_aligned,
                "note": "Critic errors and yaw fractions use exploratory training rollouts; energy uses greedy evaluation."}
     json_path = output_dir / "training_diagnostics.json"
     json_path.write_text(json.dumps(summary, indent=2, allow_nan=False) + "\n", encoding="utf-8")

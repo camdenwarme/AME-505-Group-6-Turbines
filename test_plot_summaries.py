@@ -67,6 +67,23 @@ class PlotSummaryTests(unittest.TestCase):
             self.assertGreaterEqual(energy["ylim"][1], 10)
             self.assertGreaterEqual(reward["ylim"][1], 100)
 
+    def test_wind_aligned_reference_line(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            _write_csv(root / "training_metrics.csv", ["episode", "episode_energy_mwh", "episode_return"],
+                       [{"episode": 1, "episode_energy_mwh": 8, "episode_return": 80}])
+            _write_csv(root / "evaluation_metrics.csv", ["episode", "policy", "farm_energy_mwh", "team_return"], [
+                dict(episode=0, policy="wind_aligned", farm_energy_mwh=11, team_return=110),
+                dict(episode=0, policy="greedy", farm_energy_mwh=9, team_return=90),
+            ])
+            label = "Wind-aligned benchmark (±6°/s)"
+            energy = _capture_plot(lambda: plot_training_energy(root))
+            reward = _capture_plot(lambda: plot_reward_summary(root))
+            self.assertEqual(energy["lines"][label][1], [11.0, 11.0])
+            self.assertEqual(reward["lines"][label][1], [110.0, 110.0])
+            self.assertGreaterEqual(energy["ylim"][1], 11)
+            self.assertNotIn("Aligned baseline", energy["lines"])
+
     def test_single_training_point_and_csv_only_greedy(self):
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)
