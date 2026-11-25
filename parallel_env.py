@@ -67,7 +67,7 @@ def _worker(connection, factory, gamma, threads):
             if command == "close":
                 break
             if command == "reset":
-                obs = env.reset()
+                obs = env.reset() if payload is None else env.reset(scenario=payload)
                 done = False
                 result = (obs, snapshot())
             elif command == "step":
@@ -171,10 +171,15 @@ class ProcessVecEnv:
             raise RuntimeError(f"Episode worker {index} failed:\n{result}")
         return result
 
-    def reset(self):
+    def reset(self, scenarios=None):
+        """Reset active workers, optionally replaying one scenario per worker."""
         import numpy as np
-        for connection in self.connections[:self.num_envs]:
-            connection.send(("reset", None))
+        if scenarios is None:
+            scenarios = [None] * self.num_envs
+        if len(scenarios) != self.num_envs:
+            raise ValueError("Provide one wind scenario per active episode worker.")
+        for connection, scenario in zip(self.connections, scenarios):
+            connection.send(("reset", scenario))
         results = [self._receive(i) for i in range(self.num_envs)]
         for env, (_, snapshot) in zip(self.envs, results):
             env.update(snapshot)

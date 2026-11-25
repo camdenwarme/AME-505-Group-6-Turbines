@@ -169,6 +169,7 @@ def main(*, default_layout=None):
     (run_dir / "runtime_versions.json").write_text(json.dumps(versions, indent=2))
 
     env.seed(args.seed)
+    training_scenario_factory = None
     if args.n_rollout_threads == 1:
         envs = DummyVecEnv([lambda: env])
     else:
@@ -178,6 +179,9 @@ def main(*, default_layout=None):
             wind_config=train_wind, wind_stream=0, environment_id=i), args.seed + i)
             for i in range(args.n_rollout_threads)]
         envs = ProcessVecEnv(factories, gamma=args.gamma, threads=args.threads_per_worker)
+        # Generate profiles in the same stream and environment namespace as
+        # the single-worker run. Each worker replays its assigned episode.
+        training_scenario_factory = env.make_scenario
     print(f"Collecting {args.episodes} episodes with up to {args.n_rollout_threads} per round. "
           f"Training passes per round: {args.ppo_epoch}.", flush=True)
 
@@ -232,6 +236,7 @@ def main(*, default_layout=None):
     try:
         runner = EnvRunner({"all_args": args, "envs": envs, "eval_envs": None,
                             "num_agents": env.num_agents, "device": device, "run_dir": run_dir,
+                            "training_scenario_factory": training_scenario_factory,
                             "episode_callback": record_evaluation})
         runner.run()
         from plot_training_energy import plot_training_energy

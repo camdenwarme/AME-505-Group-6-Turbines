@@ -144,6 +144,7 @@ class SharedCriticRunner(SeparatedRunner):
         for i, policy in enumerate(self.policy):
             install_bounded_action_head(policy, self.envs.action_space[i])
         self._episode_callback = config.get("episode_callback")
+        self._training_scenario_factory = config.get("training_scenario_factory")
         self._completed_episodes = 0
         self._completed_rounds = 0
         self._episode_energy_j = None
@@ -329,7 +330,15 @@ class SharedCriticRunner(SeparatedRunner):
         return residual
 
     def warmup(self):
-        obs = self.envs.reset()
+        if self._training_scenario_factory is None:
+            obs = self.envs.reset()
+        else:
+            # CSV episode numbers are one-based. Wind profiles use the same
+            # sequence with zero-based IDs, independent of worker assignment.
+            start = self._completed_episodes
+            scenarios = [self._training_scenario_factory(episode_id).to_dict()
+                         for episode_id in range(start, start + self.n_rollout_threads)]
+            obs = self.envs.reset(scenarios=scenarios)
         for i, env in enumerate(self.envs.envs):
             if getattr(env, "wind_scenario", None) is not None:
                 self._register_scenario(env.wind_scenario.to_dict(), i, "reset")

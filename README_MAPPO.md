@@ -122,7 +122,10 @@ The `--wind-mode` switch enables seeded time-varying wind inside every episode:
 ```
 
 `wind_profiles.py` samples knots using explicit master seed, stream, environment,
-and episode IDs, then interpolates between them. It uses independent speed and
+and episode IDs, then interpolates between them. Training uses the global
+episode number minus one as the wind episode ID, so a given logged episode
+gets the same profile with any worker count when the wind settings match.
+It uses independent speed and
 direction RNG substreams; toggling one quantity preserves the other's sampled
 realization. Directions are unwrapped along the shortest angular path before
 interpolation, so 359 to 1 degrees crosses north. The final partial interval

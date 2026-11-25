@@ -37,12 +37,15 @@ class Farm:
         self.action_space = [spaces.Box(-6, 6, (1,), np.float32) for _ in range(2)]
         self.episode = -1
 
-    def reset(self):
+    def reset(self, scenario=None):
         from wind_profiles import WindScenario
         self.t = 0
         self.episode += 1
-        self.wind_scenario = WindScenario([0, 16], [8, 8], [270, 270],
-            episode_id=self.episode, environment_id=self.rank, episode_seed=100 * self.rank + self.episode)
+        if scenario is None:
+            self.wind_scenario = WindScenario([0, 16], [8, 8], [270, 270],
+                episode_id=self.episode, environment_id=self.rank, episode_seed=100 * self.rank + self.episode)
+        else:
+            self.wind_scenario = WindScenario.from_dict(scenario)
         return self.obs()
 
     def obs(self):
@@ -69,7 +72,7 @@ class Farm:
                   "team_reward": .5, "farm_power_w": 10,
                   "turbine_power_w": 5, "yaw_rate_deg_s": float(actions[i][0]),
                   "scenario_id": self.wind_scenario.scenario_id,
-                  "episode_seed": self.wind_scenario.episode_seed, "wind_mode": "off"}
+                  "episode_seed": self.wind_scenario.episode_seed, "wind_mode": self.wind_scenario.mode}
                  for i in range(2)]
         if self.t == 4:
             infos[0]["wind_scenario"] = self.wind_scenario.to_dict()
@@ -85,6 +88,7 @@ class ParallelTrainingTests(unittest.TestCase):
         sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "light_mappo"))
         from config import get_config
         from shared_critic_runner import SharedCriticRunner
+        from wind_profiles import WindProfileConfig, make_wind_scenario
 
         torch.set_num_threads(1)
         args = get_config().parse_args([])
@@ -92,12 +96,18 @@ class ParallelTrainingTests(unittest.TestCase):
         args.episode_length, args.num_env_steps, args.n_rollout_threads = 4, 12, 2
         args.ppo_epoch, args.numeric_eval_interval = 1, 2
         evaluations = []
+        wind_config = WindProfileConfig(mode="both", seed=123, knot_interval_s=4)
+
+        def make_scenario(episode_id):
+            return make_wind_scenario(wind_config, 16, 8, 270, episode_id)
+
         with tempfile.TemporaryDirectory() as directory:
             envs = ProcessVecEnv([FarmFactory(i) for i in range(2)])
             runner = None
             try:
                 runner = SharedCriticRunner(dict(all_args=args, envs=envs, eval_envs=None,
                     num_agents=2, device=torch.device("cpu"), run_dir=Path(directory),
+                    training_scenario_factory=make_scenario,
                     episode_callback=lambda episode, policies: evaluations.append(episode)))
                 runner.run()
                 self.assertEqual(evaluations, [0, 2, 3])
@@ -113,6 +123,10 @@ class ParallelTrainingTests(unittest.TestCase):
                 self.assertEqual([(row["training_episode"], row["environment_index"])
                                   for row in scenarios if row["event"] == "reset"],
                                  [(1, 0), (2, 1), (3, 0)])
+                expected = [make_scenario(episode_id).to_dict() for episode_id in range(3)]
+                self.assertEqual([row["scenario"] for row in scenarios if row["event"] == "completed"], expected)
+                self.assertEqual([row["scenario_id"] for row in metrics],
+                                 [scenario["scenario_id"] for scenario in expected])
             finally:
                 envs.close()
                 if runner is not None:

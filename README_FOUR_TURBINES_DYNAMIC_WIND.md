@@ -95,7 +95,9 @@ the speed bounds determine its sampled values.
 [master wind seed, stream ID, environment ID, zero-based wind episode ID]
 ```
 
-Training uses stream 0; evaluation uses stream 1. Each episode has separate speed
+Training uses stream 0 and a shared wind-generation environment ID of 0. The
+wind episode ID is the logged training episode number minus one, independent
+of the worker assigned to it. Evaluation uses stream 1. Each episode has separate speed
 and direction substreams, so toggling one dimension preserves the realization of
 the other when all other inputs match. Generation does not consume global NumPy,
 Python, or PyTorch random numbers. Model initialization/exploration continue to
