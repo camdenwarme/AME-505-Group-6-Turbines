@@ -111,7 +111,7 @@ The `--wind-mode` switch enables seeded time-varying wind inside every episode:
 | `--eval-wind-seed` | Evaluation-wind seed; defaults to `--seed`, using a separate stream. |
 | `--wind-speed-min`, `--wind-speed-max` | Random speed knot bounds; defaults 6 and 10 m/s. |
 | `--wind-direction-half-width` | Direction knot range around the base direction; default +/-15 degrees. |
-| `--wind-knot-interval` | Seconds between random knots; default 120. |
+| `--wind-knot-interval` | Seconds between wind knots. Randomized direction holds for this long. Default 120. |
 
 ```powershell
 # Four turbines with fixed wind and numeric evaluations
@@ -122,15 +122,15 @@ The `--wind-mode` switch enables seeded time-varying wind inside every episode:
 ```
 
 `wind_profiles.py` samples knots using explicit master seed, stream, environment,
-and episode IDs, then interpolates between them. Training uses the global
+and episode IDs. Training uses the global
 episode number minus one as the wind episode ID, so a given logged episode
 gets the same profile with any worker count when the wind settings match.
 It uses independent speed and
 direction RNG substreams; toggling one quantity preserves the other's sampled
-realization. Directions are unwrapped along the shortest angular path before
-interpolation, so 359 to 1 degrees crosses north. The final partial interval
-preserves the nominal transition timescale. Direction bounds constrain sampled
-knots; shortest paths can leave a direction sector wider than 180 degrees.
+realization. Speed ramps linearly between knots. Direction holds constant until
+the next knot and switches immediately there. A partial final interval keeps the
+last direction and follows the ongoing speed ramp until the episode ends. Saved
+scenarios replay using their recorded direction interpolation.
 No global NumPy randomness is consumed by profile generation.
 
 Dynamic wind is applied to the new ambient-history head at the next measurement

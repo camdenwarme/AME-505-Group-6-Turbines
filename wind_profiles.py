@@ -1,8 +1,7 @@
 """Seeded, replayable wind functions for training and evaluation episodes.
 
-Random values are sampled at time knots and interpolated linearly between
-knots. Direction is interpolated on an unwrapped angle so 359 -> 1 degrees
-travels through north. Profiles are generated from explicit episode identifiers,
+Random values are sampled at time knots. Speed is interpolated linearly and
+direction is held until the next knot. Profiles use explicit episode identifiers,
 not the process-global NumPy RNG; evaluation cannot consume training wind draws.
 """
 
@@ -16,6 +15,15 @@ import numpy as np
 
 
 MODES = ("off", "speed", "direction", "both")
+_LINEAR_DIRECTION = "linear_unwrapped_shortest_path"
+_STEPPED_DIRECTION = "step_hold"
+_LINEAR_GENERATOR = "piecewise_linear_wind_v1"
+_STEPPED_GENERATOR = "linear_speed_stepped_direction_v1"
+
+
+def _hold_direction(time, knots, directions):
+    indices = np.searchsorted(knots, time, side="right") - 1
+    return directions[np.maximum(indices, 0)]
 
 
 def _identifier(value, name):
@@ -26,15 +34,12 @@ def _identifier(value, name):
 
 @dataclass(frozen=True)
 class WindProfileConfig:
-    """Settings for a piecewise-linear wind function.
+    """Settings for wind with linearly changing speed and stepped direction.
 
-    Speed bounds and direction half-width bound the *sampled knots*. For
-    direction sectors wider than 180 degrees, the shortest path between two
-    knots can pass outside that sector. Half-width 180 covers the full circle.
-    Adjacent direction knots are connected over at most 180 degrees. Speed
-    changes are at most (speed_max-speed_min)/knot_interval_s per second, and
-    direction changes at most min(2*half_width,180)/knot_interval_s degrees per
-    second. The final partial interval preserves that timescale.
+    Speed and direction knots are sampled within their configured bounds.
+    A direction half-width of 180 degrees covers the full circle. Speed changes
+    are at most (speed_max-speed_min)/knot_interval_s per second, including in
+    the last partial interval. Direction switches at each knot.
     """
 
     mode: str = "off"
@@ -75,7 +80,7 @@ class WindProfileConfig:
 class WindScenario:
     """An explicit wind realization that can be replayed without RNG calls.
 
-    ``directions_deg`` contains continuous, unwrapped angles for interpolation;
+    ``directions_deg`` contains unwrapped angles at the recorded knots.
     ``sample(t)`` returns the meteorological wind-from angle wrapped to [0,360).
     Values outside the recorded time interval use the nearest endpoint. Arrays
     are copied and marked read-only to prevent a replay from mutating its source.
@@ -91,10 +96,13 @@ class WindScenario:
     stream_id: int = 0
     environment_id: int = 0
     scenario_id: str = ""
+    direction_interpolation: str = _LINEAR_DIRECTION
 
     def __post_init__(self):
         if self.mode not in MODES:
             raise ValueError(f"Wind mode must be one of {MODES}.")
+        if self.direction_interpolation not in (_LINEAR_DIRECTION, _STEPPED_DIRECTION):
+            raise ValueError("Unsupported wind direction interpolation.")
         for name in ("master_seed", "episode_seed", "episode_id", "stream_id", "environment_id"):
             object.__setattr__(self, name, _identifier(getattr(self, name), name))
         arrays = []
@@ -124,8 +132,10 @@ class WindScenario:
         return float(self.times_s[-1])
 
     def _payload(self):
-        return {"format_version": 1, "generator": "piecewise_linear_wind_v1",
-                "direction_interpolation": "linear_unwrapped_shortest_path",
+        generator = (_STEPPED_GENERATOR if self.direction_interpolation == _STEPPED_DIRECTION
+                     else _LINEAR_GENERATOR)
+        return {"format_version": 1, "generator": generator,
+                "direction_interpolation": self.direction_interpolation,
                 "mode": self.mode, "master_seed": self.master_seed,
                 "episode_seed": self.episode_seed, "episode_id": self.episode_id,
                 "stream_id": self.stream_id, "environment_id": self.environment_id,
@@ -140,17 +150,18 @@ class WindScenario:
         data = dict(value)
         if data.pop("format_version", 1) != 1:
             raise ValueError("Unsupported wind scenario format.")
-        if data.pop("generator", "piecewise_linear_wind_v1") != "piecewise_linear_wind_v1":
+        if data.pop("generator", _LINEAR_GENERATOR) not in (_LINEAR_GENERATOR, _STEPPED_GENERATOR):
             raise ValueError("Unsupported wind scenario generator.")
-        if data.pop("direction_interpolation", "linear_unwrapped_shortest_path") != "linear_unwrapped_shortest_path":
-            raise ValueError("Unsupported wind direction interpolation.")
         return cls(**data)
 
     def direction_unwrapped(self, time_s):
         time = np.asarray(time_s, dtype=float)
         if not np.isfinite(time).all():
             raise ValueError("Wind sample time must be finite.")
-        direction = np.interp(time, self.times_s, self.directions_deg)
+        if self.direction_interpolation == _STEPPED_DIRECTION:
+            direction = _hold_direction(time, self.times_s, self.directions_deg)
+        else:
+            direction = np.interp(time, self.times_s, self.directions_deg)
         return float(direction) if time.ndim == 0 else direction
 
     def sample(self, time_s):
@@ -194,19 +205,20 @@ def make_wind_scenario(config, duration_s, base_speed, base_direction, episode_i
                                dtype=float) * config.knot_interval_s
     speeds = (speed_rng.uniform(config.speed_min, config.speed_max, size=len(full_times))
               if config.mode in ("speed", "both") else np.full(len(full_times), base_speed))
-    if config.mode in ("direction", "both"):
+    varying_direction = config.mode in ("direction", "both")
+    if varying_direction:
         knots = (base_direction + direction_rng.uniform(-config.direction_half_width,
                                                         config.direction_half_width,
                                                         size=len(full_times))) % 360
         directions = np.rad2deg(np.unwrap(np.deg2rad(knots)))
     else:
         directions = np.full(len(full_times), base_direction % 360)
-    # A final partial interval samples the same ongoing line. Drawing a fresh
-    # endpoint at duration would compress a full random transition into a few
-    # seconds when duration is not a multiple of the nominal knot interval.
+    # The episode endpoint samples the ongoing speed ramp and holds the last
+    # direction until the next actual knot, even in a partial interval.
     times = np.append(full_times[full_times < duration_s], duration_s)
     speeds = np.interp(times, full_times, speeds)
-    directions = np.interp(times, full_times, directions)
+    directions = _hold_direction(times, full_times, directions)
     return WindScenario(times, speeds, directions, mode=config.mode,
                         master_seed=config.seed, episode_seed=episode_seed,
-                        episode_id=episode_id, stream_id=stream_id, environment_id=environment_id)
+                        episode_id=episode_id, stream_id=stream_id, environment_id=environment_id,
+                        direction_interpolation=_STEPPED_DIRECTION if varying_direction else _LINEAR_DIRECTION)

@@ -1,4 +1,4 @@
-"""Wind reproducibility and circular-interpolation checks without a simulator."""
+"""Wind reproducibility, direction switches, and replay checks without a simulator."""
 
 import json
 import unittest
@@ -35,13 +35,28 @@ class WindProfileTests(unittest.TestCase):
         np.testing.assert_array_equal(combined.speeds_m_s, self.generate("speed").speeds_m_s)
         np.testing.assert_array_equal(combined.directions_deg, self.generate("direction").directions_deg)
 
-    def test_short_final_interval_preserves_transition_rate(self):
+    def test_short_final_interval_preserves_speed_transition_rate(self):
         config = WindProfileConfig(mode="both", seed=31, knot_interval_s=30,
                                    speed_min=6, speed_max=10, direction_half_width=15)
         profile = make_wind_scenario(config, 91, 8, 359, 0)
         delta = np.diff(profile.times_s)
         self.assertTrue(np.all(np.abs(np.diff(profile.speeds_m_s)) / delta <= 4 / 30 + 1e-12))
-        self.assertTrue(np.all(np.abs(np.diff(profile.directions_deg)) / delta <= 30 / 30 + 1e-12))
+
+    def test_direction_switches_at_each_knot_and_holds_through_partial_interval(self):
+        config = WindProfileConfig(mode="both", seed=31)
+        profile = make_wind_scenario(config, 251, 8, 359, 0)
+        np.testing.assert_array_equal(profile.times_s, [0, 120, 240, 251])
+        first, second, third, final = profile.directions_deg % 360
+        self.assertNotEqual(first, second)
+        self.assertNotEqual(second, third)
+        self.assertEqual(third, final)
+        times = [-1, 0, 60, 119.999, 120, 180, 239.999, 240, 250, 251, 260]
+        speeds, directions = profile.sample(times)
+        np.testing.assert_array_equal(directions,
+                                      [first] * 4 + [second] * 3 + [third] * 4)
+        self.assertAlmostEqual(speeds[2], (profile.speeds_m_s[0] + profile.speeds_m_s[1]) / 2)
+        exact_end = make_wind_scenario(config, 240, 8, 359, 0)
+        self.assertEqual(exact_end.sample(240)[1], third)
 
     def test_modes_vary_only_requested_quantities_and_cover_exact_duration(self):
         for mode in ("off", "speed", "direction", "both"):
@@ -65,6 +80,8 @@ class WindProfileTests(unittest.TestCase):
 
     def test_north_crossing_and_scalar_vector_samples(self):
         profile = WindScenario([0, 10], [6, 10], [359, 361], mode="both")
+        replay = WindScenario.from_dict(profile.to_dict())
+        self.assertEqual(replay.sample(5), (8, 0))
         self.assertEqual(profile.sample(5), (8, 0))
         np.testing.assert_allclose(profile.sample([0, 5, 10]), [[6, 8, 10], [359, 0, 1]])
         self.assertEqual(profile.direction_unwrapped(5), 360)

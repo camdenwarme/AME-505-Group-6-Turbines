@@ -30,7 +30,7 @@ def main(*, default_layout=None):
     bootstrap.add_argument("--wind-direction-half-width", type=float, default=15.0,
                            help="Random direction knot half-width around --wind-direction, in degrees.")
     bootstrap.add_argument("--wind-knot-interval", type=float, default=120.0,
-                           help="Seconds between random wind knots, with linear interpolation.")
+                           help="Seconds between wind knots. Speed ramps and direction switches at the knots.")
     bootstrap.add_argument("--dt", type=float, default=4.0)
     bootstrap.add_argument("--video-fps", type=float, default=None,
                            help="Override playback FPS; default is 10 / dt (10x simulation speed).")

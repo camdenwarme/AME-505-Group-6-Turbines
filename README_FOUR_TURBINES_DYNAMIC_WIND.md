@@ -103,14 +103,11 @@ the other when all other inputs match. Generation does not consume global NumPy,
 Python, or PyTorch random numbers. Model initialization/exploration continue to
 use the model seed separately.
 
-Uniform random values are drawn at knots and connected linearly. Direction knots
-are unwrapped along shortest angular paths, so 359 to 1 degrees passes through
-north. Values displayed/logged as ambient direction are wrapped to [0,360).
-The final partial knot interval samples the ongoing line rather than squeezing a
-full random transition into a shorter interval. The knot interval therefore
-controls a finite transition timescale; these profiles are not turbulent CFD.
-Direction bounds constrain knots. For a sector wider than 180 degrees, shortest
-paths can leave that sector; half-width 180 covers the entire circle.
+Uniform random values are drawn at knots. Speed interpolates linearly between
+knots. Direction switches to the next sampled value at each knot and holds until
+the following knot. Values displayed/logged as ambient direction are wrapped to
+[0,360). The final partial interval follows the ongoing speed ramp and keeps the
+last sampled direction. A direction half-width of 180 degrees covers the entire circle.
 
 All realized arrays and seed identifiers are serialized. Replaying those arrays
 avoids dependence on future changes to random-generation code. `reset(scenario=...)`
@@ -236,7 +233,7 @@ obs = env.reset(scenario=scenario)  # env duration must match the recorded durat
 
 | Location | Actual change and reason |
 |---|---|
-| `wind_profiles.py` | New validated seeded piecewise-linear profile generator, serialization and replay; separates wind draws from policy RNG |
+| `wind_profiles.py` | Seeded wind profiles with linear speed ramps, stepped directions, and replay |
 | `wind_farm_env.py: WindFarmEnv.__init__/reset/_measure/step` | N-dependent layout/spaces/arrays/measurement checks/rewards; removes two-agent shape assumptions |
 | `wind_farm_env.py: make_scenario/_prepare_next_tick/_YawRateController` | Per-episode functions, correct ambient/history timing and absolute-heading control under changing wind |
 | `train_mappo.py` | Wind/layout CLI, model and wind seed logging, N-derived runner configuration, explicit held-out replay and numeric state files |
