@@ -366,11 +366,10 @@ deterministic action rule (the `tanh`-transformed Gaussian mean) evaluates the
 actors after every `--numeric-eval-interval` completed episodes (default 10) and
 at the final episode.
 
-By default, episode 0 also runs an ideal wind-aligned benchmark on the same wind
-profile. At each tick it points every turbine into its measured local wind for
-0° relative yaw without the usual 6°/s limit. OFF samples inflow with the rotor
-in its ambient-aligned position and uses zero yaw loss for the power calculation.
-The controller sets the local-wind heading and records it for wake propagation.
+By default, episode 0 also runs a wind-aligned benchmark on the same wind
+profile. At each tick it uses the latest measured local wind direction to set
+the next yaw command, with a maximum rotational speed of 6°/s. The resulting
+headings are used for power calculations and wake propagation.
 Pass `--no-wind-aligned-episode-zero` to omit the benchmark or
 `--wind-aligned-episode-zero` to enable it explicitly.
 
@@ -467,7 +466,10 @@ reward data with `python plot_rewards.py <run-folder>` and rebuild the HTML with
 Each video shows a top view of
 the actual layout, rotor bars and front-facing orientation arrows, ambient/local
 wind arrows and speeds, headings, relative yaw angles, applied yaw rates, farm
-power history, and total energy. No synthetic wake field is drawn. Backward-facing
+power history, and total energy. The wake overlay colors the modeled streamwise
+wind-speed deficit at mean rotor height on a fixed 0–100% scale. It blends local
+FLORIS samples reconstructed from OFF's wake history. Pass `--no-wake-overlay`
+for a video without the flow field. Backward-facing
 rotors are shown at their real angles. The initial and final episode states are
 included.
 The power subplot automatically zooms to the power values observed so far, with

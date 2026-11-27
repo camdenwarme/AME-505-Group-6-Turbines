@@ -10,6 +10,7 @@ from evaluate_wind_farm import evaluation_controls, evaluation_snapshot, write_e
 
 import imageio.v2 as imageio
 from matplotlib.backends.backend_agg import FigureCanvasAgg
+from matplotlib.colors import LinearSegmentedColormap
 from matplotlib.figure import Figure
 import numpy as np
 import torch
@@ -19,13 +20,15 @@ BACKGROUND = "#101b2b"
 FOREGROUND = "#e6edf5"
 COLORS = ("#69b9ff", "#ffc46b", "#dd95ff", "#ff8f98", "#96d885", "#78ded5")
 WIND = "#5ce0c5"
+WAKE_COLORS = LinearSegmentedColormap.from_list("wake_deficit", (BACKGROUND, "#244888", "#4698cf", "#c6f2f8"))
 
 
 class WindFarmVideo:
-    def __init__(self, fps, episode=None, policy="greedy"):
+    def __init__(self, fps, episode=None, policy="greedy", *, wake_overlay=True):
         self.fps = fps
         self.episode = episode
         self.policy = policy.replace("wind_aligned", "wind-aligned").replace("_", " ")
+        self.wake_overlay = wake_overlay
         self.figure = Figure(figsize=(12.8, 8), dpi=100, facecolor=BACKGROUND)
         self.canvas = FigureCanvasAgg(self.figure)
 
@@ -51,9 +54,13 @@ class WindFarmVideo:
             fig.text(0.055, 0.865, f"Wind scenario: {scenario_id}",
                      color="#a5b4c8", fontsize=8)
 
-        farm = fig.add_axes([0.065, 0.40, 0.65, 0.44], facecolor=BACKGROUND)
-        farm.set_xlim(positions[:, 0].min() - 300, positions[:, 0].max() + 300)
-        farm.set_ylim(positions[:, 1].min() - 290, positions[:, 1].max() + 370)
+        sample_wake = getattr(env, "sample_wake_deficit", None) if self.wake_overlay else None
+        farm_bounds = [0.065, 0.47, 0.65, 0.37] if sample_wake else [0.065, 0.40, 0.65, 0.44]
+        farm = fig.add_axes(farm_bounds, facecolor=BACKGROUND)
+        padding = 3 * max(turbine.diameter for turbine in turbines) if sample_wake else 300
+        farm.set_xlim(positions[:, 0].min() - padding, positions[:, 0].max() + padding)
+        farm.set_ylim(positions[:, 1].min() - (padding if sample_wake else 290),
+                      positions[:, 1].max() + max(padding, 370))
         farm.set_aspect("equal", adjustable="box")
         farm.set_xlabel("East / x (m)", color=FOREGROUND)
         farm.set_ylabel("North / y (m)", color=FOREGROUND)
@@ -61,6 +68,18 @@ class WindFarmVideo:
         for spine in farm.spines.values():
             spine.set_color("#35465b")
         farm.grid(color="#26364b", linewidth=0.6)
+
+        if sample_wake:
+            x = np.linspace(*farm.get_xlim(), 81)
+            y = np.linspace(*farm.get_ylim(), 61)
+            deficit = sample_wake(x, y)
+            mesh = farm.pcolormesh(x, y, deficit, shading="gouraud", cmap=WAKE_COLORS,
+                                   vmin=0, vmax=100, zorder=0)
+            legend_axis = fig.add_axes([0.17, 0.36, 0.44, 0.012])
+            legend = fig.colorbar(mesh, cax=legend_axis, orientation="horizontal", ticks=[0, 25, 50, 75, 100])
+            legend.ax.set_title("Modeled wind-speed deficit (%)", color=FOREGROUND, fontsize=8)
+            legend.ax.tick_params(colors=FOREGROUND, labelsize=8, length=2)
+            legend.outline.set_edgecolor("#35465b")
 
         # Meteorological angles point toward the source; flow points opposite.
         ambient_radians = np.deg2rad(env.wind_direction)
@@ -102,12 +121,17 @@ class WindFarmVideo:
             y = 0.97 - i * (0.86 / count)
             panel.text(0, y, f"TURBINE {i + 1}", color=COLORS[i % len(COLORS)],
                        fontsize=12 if compact else 14, weight="bold")
-            panel.text(0, y - (0.035 if compact else 0.055),
-                       f"Heading      {headings[i]:7.1f}°\n"
-                       f"Relative yaw {obs[i, 2]:+7.1f}°\n"
-                       f"Yaw rate     {rates[i]:+7.2f}°/s\n"
-                       f"Local wind   {obs[i, 0]:7.2f} m/s\n"
-                       f"Wind from    {obs[i, 1]:7.1f}°",
+            if count > 4:
+                readings = (f"Heading {headings[i]:.1f}°   Yaw {obs[i, 2]:+.1f}°\n"
+                            f"Yaw rate {rates[i]:+.2f}°/s\n"
+                            f"Wind {obs[i, 0]:.2f} m/s from {obs[i, 1]:.1f}°")
+            else:
+                readings = (f"Heading      {headings[i]:7.1f}°\n"
+                            f"Relative yaw {obs[i, 2]:+7.1f}°\n"
+                            f"Yaw rate     {rates[i]:+7.2f}°/s\n"
+                            f"Local wind   {obs[i, 0]:7.2f} m/s\n"
+                            f"Wind from    {obs[i, 1]:7.1f}°")
+            panel.text(0, y - (0.035 if compact else 0.055), readings,
                        color=FOREGROUND, fontsize=8.5 if compact else 11, family="monospace",
                        va="top", linespacing=1.3 if compact else 1.8)
         panel.text(0, 0.0 if compact else 0.08, "Rotor bar + front-facing arrow\nGreen arrows: wind travel direction\n"
@@ -131,15 +155,15 @@ class WindFarmVideo:
         for spine in power.spines.values():
             spine.set_color("#35465b")
         fig.text(0.055, 0.025,
-                 f"Top view • {self.policy} policy evaluation • {env.dt * self.fps:g}× simulation speed • "
-                 "wake field not drawn", color="#a5b4c8", fontsize=9)
+                 f"Top view • {self.policy} policy evaluation • {env.dt * self.fps:g}× simulation speed",
+                 color="#a5b4c8", fontsize=9)
         self.canvas.draw()
         return np.asarray(self.canvas.buffer_rgba())[:, :, :3].copy()
 
 
 @torch.no_grad()
 def record_policy_video(env, policies, output_path, fps=None, episode=None, *, scenario=None,
-                        wind_aligned=False):
+                        wind_aligned=False, wake_overlay=True):
     """Record a policy's video and per-turbine state-history plots.
 
     By default, each frame lasts dt / 10 seconds (10x simulated-time playback).
@@ -159,7 +183,7 @@ def record_policy_video(env, policies, output_path, fps=None, episode=None, *, s
         energy_history = [0.0]
         initial_rates = np.zeros(len(env.action_space))
         snapshots = [evaluation_snapshot(env, obs, 0, initial_rates)]
-        renderer = WindFarmVideo(fps, episode, kind)
+        renderer = WindFarmVideo(fps, episode, kind, wake_overlay=wake_overlay)
         # ImageIO supplies the input FPS explicitly, so FFmpeg can skip rate probing.
         with imageio.get_writer(output_path, format="FFMPEG", fps=fps,
                                 codec="libx264", quality=8, macro_block_size=16,

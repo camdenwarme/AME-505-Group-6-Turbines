@@ -30,6 +30,16 @@ import matplotlib.pyplot as plt
 lg = logging.getLogger(__name__)
 
 
+def _axis_tiles(points, count):
+    """Blend neighboring historical flow solutions with linear weights."""
+    anchors = np.linspace(points[0], points[-1], count)
+    spacing = anchors[1] - anchors[0]
+    for anchor in anchors:
+        weights = np.maximum(1 - np.abs(points - anchor) / spacing, 0)
+        indices = np.flatnonzero(weights > 0)
+        yield anchor, indices, weights[indices]
+
+
 class WakeSolver(ABC):
     
     settings_sol: dict
@@ -571,6 +581,7 @@ class TWFSolver(WakeSolver):
         """
         super(TWFSolver, self).__init__(settings_sol, settings_vis)
         lg.info('FLORIDyn TWF solver created.')
+        self._visualization_wake = None
 
         if settings_sol["wake_model"].startswith("FLORIS"):
             self.floris_wake = wm.Floris4Wake(settings_wke, np.array([]), np.array([]), np.array([]))
@@ -727,24 +738,8 @@ class TWFSolver(WakeSolver):
         
         return np.array([u_eff, v_eff]), m
 
-    def _get_wind_speeds_location(self, loc: np.ndarray, wind_farm: wfm.WindFarm) -> np.ndarray:
-        """
-        Calculates the effective wind speed at a location
-        Parameters
-        ----------
-        loc : np.ndarray
-            x,y,z coordinates with which respect to the effective wind speed should be derived
-        wind_farm
-            influencing wind farm
-
-        Returns
-        -------
-        nd.array
-            abs wind speed at location
-        """
-        # Load current data
-        wind_farm_layout = wind_farm.get_layout()
-
+    def _wind_farm_at_location(self, loc, wind_farm, wind_farm_layout):
+        """Reconstruct the temporary farm from wake histories near a point."""
         # Create an index range over all nT turbines
         inf_turbines = np.arange(wind_farm.nT)
 
@@ -766,9 +761,9 @@ class TWFSolver(WakeSolver):
             point_b = op_locations[ind_op[1], 0:2].transpose()
             point_c = loc[0:2].transpose()
 
-            weight_d = ((point_b - point_a) @ (point_c - point_a)) / ((point_b - point_a) @ (point_b - point_a))
-            # Limit weight_d to [0,1]
-            weight_d = np.fmin(np.fmax(weight_d, 0), 1)
+            segment = point_b - point_a
+            length_squared = segment @ segment
+            weight_d = np.clip(segment @ (point_c - point_a) / length_squared, 0, 1) if length_squared else 0.0
 
             r0 = 1 - weight_d
             r1 = weight_d
@@ -797,9 +792,34 @@ class TWFSolver(WakeSolver):
 
         lg.info('TWF layout for the location is:')
         lg.info(twf_layout)
+        return twf_layout, twf_t_states, twf_a_states
+
+    def sample_wake_deficit(self, wind_farm, x, y, height):
+        """Sample and blend height-slice deficits from local historical farms."""
+        if self._visualization_wake is None:
+            # Point sampling writes to FLORIS's flow field. Keep its state
+            # separate from the wake model used to measure turbine power.
+            empty = np.array([])
+            self._visualization_wake = wm.Floris4Wake(self.floris_wake.settings, empty, empty, empty)
+        wake = self._visualization_wake
+        layout = wind_farm.get_layout()
+        deficit = np.zeros((len(y), len(x)))
+        x_tiles = list(_axis_tiles(x, 4))
+        for center_y, rows, y_weights in _axis_tiles(y, 3):
+            for center_x, columns, x_weights in x_tiles:
+                center = np.array([center_x, center_y, height])
+                wake.set_wind_farm(*self._wind_farm_at_location(center, wind_farm, layout))
+                grid_x, grid_y = np.meshgrid(x[columns], y[rows])
+                values = wake.sample_wake_deficit(grid_x.ravel(), grid_y.ravel(),
+                                                  np.full(grid_x.size, height))
+                deficit[np.ix_(rows, columns)] += values.reshape(grid_x.shape) * np.outer(y_weights, x_weights)
+        return deficit
+
+    def _get_wind_speeds_location(self, loc: np.ndarray, wind_farm: wfm.WindFarm) -> np.ndarray:
+        """Calculate effective wind speed at a location and update debug plots."""
 
         # Set wind farm in the wake model
-        self.floris_wake.set_wind_farm(twf_layout, twf_t_states, twf_a_states)
+        self.floris_wake.set_wind_farm(*self._wind_farm_at_location(loc, wind_farm, wind_farm.get_layout()))
 
         # Run FLORIS and get velocities for points
         vel_at_loc = self.floris_wake.get_point_vel(

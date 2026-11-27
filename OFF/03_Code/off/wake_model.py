@@ -598,6 +598,12 @@ class Floris4Wake(WakeModel):
         else:
             return self.fmodel.sample_flow_at_points(x, y, z)
         
+    def sample_wake_deficit(self, x, y, z):
+        """Return the percent reduction from local unwaked streamwise speed."""
+        speed = self.fmodel.sample_flow_at_points(x, y, z)[0]
+        ambient = self.fmodel.core.flow_field.u_initial_sorted[0, :, 0, 0]
+        return np.clip(100 * (1 - speed / ambient), 0, 100)
+
     def get_point_vel(self, x: np.ndarray, y: np.ndarray, z: np.ndarray) -> np.ndarray:
         """
         Get datapoints to visualize the turbine wake field

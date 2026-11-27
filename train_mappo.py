@@ -36,10 +36,12 @@ def main(*, default_layout=None):
                            help="Override playback FPS; default is 10 / dt (10x simulation speed).")
     bootstrap.add_argument("--no-video", action="store_true",
                            help="Run numeric evaluations without rendering videos.")
+    bootstrap.add_argument("--wake-overlay", action=argparse.BooleanOptionalAction, default=True,
+                           help="Show modeled wind-speed deficits in evaluation videos (enabled by default).")
     bootstrap.add_argument("--evaluate-aligned-baseline", action="store_true",
                            help="Also simulate an aligned reference during evaluation.")
     bootstrap.add_argument("--wind-aligned-episode-zero", action=argparse.BooleanOptionalAction, default=True,
-                           help="Run an additional ideal wind-aligned benchmark at episode 0 (enabled by default).")
+                           help="Run an additional rate-limited wind-aligned benchmark at episode 0 (enabled by default).")
     bootstrap.add_argument("--numeric-eval-interval", type=int, default=10,
                            help="Evaluate the greedy policy after this many completed episodes.")
     bootstrap.add_argument("--team-reward-weight", type=float, default=0.5,
@@ -227,7 +229,8 @@ def main(*, default_layout=None):
                 from wind_farm_video import record_policy_video
                 video = record_policy_video(evaluation_env, policies,
                                             run_dir / f"wind_farm_episode{episode}.mp4",
-                                            args.video_fps, episode=episode, scenario=scenario)
+                                            args.video_fps, episode=episode, scenario=scenario,
+                                            wake_overlay=args.wake_overlay)
                 print(f"Evaluation video: {video}", flush=True)
         finally:
             evaluation_env.close()

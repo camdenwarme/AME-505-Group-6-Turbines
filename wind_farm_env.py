@@ -23,6 +23,9 @@ from fdynsim import DEFAULT_CASE, REPO
 from wind_profiles import WindProfileConfig, WindScenario, make_wind_scenario
 
 
+MAX_YAW_RATE_DEG_S = 6.0
+
+
 def _wind_from_direction(velocity):
     return (270 - np.rad2deg(np.arctan2(velocity[:, 1], velocity[:, 0]))) % 360
 
@@ -58,28 +61,12 @@ class _YawRateController:
 
 
 class WindAlignedPolicy(_YawRateController):
-    """Ideal controller that faces the current local inflow at every tick."""
+    """Turn toward the latest measured local inflow at the actuator limit."""
 
-    def __init__(self, dt, direction, num_agents, prepare_next_tick):
-        super().__init__(dt, direction, num_agents, prepare_next_tick)
-        self._has_heading = False
-
-    def align_to_inflow(self, turbines, local_directions):
-        offsets = _wrap_yaw(local_directions - self.direction)
-        headings = self.direction + offsets
-        if self._has_heading:
-            self.applied_rates[:] = _wrap_yaw(headings - self.headings) / self.dt
-        self._has_heading = True
-        self.headings[:] = headings
-        for turbine, offset in zip(turbines, offsets):
-            # Save the actual heading and its ambient-relative yaw for wakes
-            # propagated from this tick. The actor yaw is local-relative.
-            turbine.set_yaw(self.direction, -offset)
-
-    def __call__(self, turbine, i_t, t):
-        # FLORIS first samples the incoming flow at the ambient-aligned rotor
-        # and applies zero yaw loss for an ideal rotor facing that inflow.
-        turbine.set_yaw(self.direction, 0.0)
+    def track_inflow(self, local_directions):
+        # The standard controller applies this command before the next measurement.
+        required_rates = _wrap_yaw(local_directions - self.headings) / self.dt
+        self.rates[:] = np.clip(required_rates, -MAX_YAW_RATE_DEG_S, MAX_YAW_RATE_DEG_S)
 
 
 class WindFarmEnv:
@@ -126,7 +113,8 @@ class WindFarmEnv:
         table = yaml.safe_load(curve_path.read_text())["power_thrust_table"]
         self._aligned_curve_speeds = np.asarray(table["wind_speed"], dtype=float)
         self._aligned_curve_power_w = np.asarray(table["power"], dtype=float) * 1000.0
-        self.action_space = [spaces.Box(-6.0, 6.0, (1,), np.float32) for _ in range(self.num_agents)]
+        self.action_space = [spaces.Box(-MAX_YAW_RATE_DEG_S, MAX_YAW_RATE_DEG_S, (1,), np.float32)
+                             for _ in range(self.num_agents)]
         self.observation_space = [
             spaces.Box(np.array([0, 0, -180], np.float32),
                        np.array([np.inf, 360, 180], np.float32)) for _ in range(self.num_agents)]
@@ -177,7 +165,7 @@ class WindFarmEnv:
             os.chdir(previous)
 
     def reset(self, scenario=None, *, wind_aligned=False):
-        """Start a rollout, optionally using ideal local-wind alignment."""
+        """Start a rollout, optionally using rate-limited local-wind alignment."""
         self.close()
         if scenario is None:
             scenario = self.make_scenario()
@@ -270,8 +258,6 @@ class WindFarmEnv:
         speed = np.linalg.norm(velocity, axis=1)
         direction = _wind_from_direction(velocity)
         turbines = self.interface.wind_farm.turbines
-        if isinstance(self.controller, WindAlignedPolicy):
-            self.controller.align_to_inflow(turbines, direction)
         headings = np.array([t.get_yaw_orientation() for t in turbines])
         # OFF convention: yaw = LOCAL wind-from direction minus rotor heading.
         # FLORIS supplies a rotor-averaged world-coordinate vector, including
@@ -281,7 +267,16 @@ class WindFarmEnv:
         if (self._turbine_power.shape != (self.num_agents,) or obs.shape != (self.num_agents, 3)
                 or not np.isfinite(obs).all() or not np.isfinite(power)):
             raise RuntimeError("OFF produced invalid local wind or FLORIS power.")
+        if isinstance(self.controller, WindAlignedPolicy):
+            self.controller.track_inflow(direction)
         return obs, power
+
+    def sample_wake_deficit(self, x, y):
+        """Sample the modeled wake for video on a slice at mean rotor height."""
+        sim = self.interface.off_sim
+        height = np.mean([turbine.get_rotor_pos()[2] for turbine in sim.wind_farm.turbines])
+        with self._scope():
+            return sim.wake_solver.sample_wake_deficit(sim.wind_farm, x, y, height)
 
     def get_centralized_obs(self):
         """Critic information at the current measurement, including time left.
@@ -343,7 +338,7 @@ class WindFarmEnv:
                 raise ValueError(f"Expected finite yaw rates with shape ({self.num_agents}, 1).")
             # Preserve the runner's original samples/log probabilities in its buffer;
             # actuator saturation is part of the environment transition.
-            self.controller.rates = np.clip(rates[:, 0], -6, 6)
+            self.controller.rates = np.clip(rates[:, 0], -MAX_YAW_RATE_DEG_S, MAX_YAW_RATE_DEG_S)
         with self._scope():
             obs, power = self._measure()
         turbine_interval_energy = 0.5 * (self._previous_turbine_power + self._turbine_power) * self.dt

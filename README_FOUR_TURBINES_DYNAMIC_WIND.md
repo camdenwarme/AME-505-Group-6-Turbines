@@ -77,7 +77,7 @@ account for departures from that approximation.
 | `--wind-knot-interval` | 120.0 | Nominal time in seconds between random knots |
 | `--layout-file` | none | JSON layout array; omission selects square4 |
 | `--numeric-eval-interval` | 10 | Completed training episodes between evaluations |
-| `--wind-aligned-episode-zero` | true | Run an additional ideal local-wind benchmark at episode 0. Disable with `--no-wind-aligned-episode-zero`. |
+| `--wind-aligned-episode-zero` | true | Run an additional rate-limited local-wind benchmark at episode 0. Disable with `--no-wind-aligned-episode-zero`. |
 | `--no-video` | false | Keep numeric evaluation and trajectory logs without MP4 rendering |
 
 `off` produces a constant explicit scenario. `speed` varies speed over time while
@@ -145,8 +145,8 @@ meaningful at one fixed dynamic test condition; it is not a multi-scenario
 generalization test.
 
 Episode 0 uses the untrained greedy actors. The additional `wind_aligned` rollout
-sets each turbine's heading to the current local wind-from direction without a
-yaw-rate limit. It saves `wind_aligned_steps.csv` and supplies the dashed benchmark
+turns each turbine toward the latest measured local wind-from direction at up to
+6°/s. It saves `wind_aligned_steps.csv` and supplies the dashed benchmark
 line on both farm-energy plots. Later evaluations use the trained greedy actors.
 Numeric evaluation and MP4 replay the same greedy policy and wind scenario at each
 checkpoint. Under fixed wind the optional reference retains

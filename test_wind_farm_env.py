@@ -93,29 +93,59 @@ class WindFarmEnvTests(unittest.TestCase):
             env.close()
             other.close()
 
-    def test_wind_aligned_policy_faces_current_local_wind(self):
-        scenario = WindScenario([0, 4, 8], [8, 9, 8], [359, 361, 405], mode="both")
-        env = two_env(episode_length=2)
+    def test_wake_overlay_preserves_downstream_history_after_wind_switch(self):
+        scenario = WindScenario([0, 4, 8], [8, 8, 8], [270, 360, 360],
+                                mode="direction", direction_interpolation="step_hold")
+        env = WindFarmEnv(episode_length=2, layout=[(0, 0)])
+        x = np.linspace(-600, 900, 31)
+        y = np.linspace(-600, 600, 25)
+        try:
+            env.reset(scenario=scenario)
+            field = env.sample_wake_deficit(x, y)
+            self.assertEqual(field.shape, (len(y), len(x)))
+            self.assertTrue(np.all((field >= 0) & (field <= 100)))
+            east_wake = field[12, 24]
+            self.assertGreater(east_wake, 10)
+            self.assertLess(field[12, 4], 1)
+
+            env.step(np.zeros((1, 1)))
+            self.assertEqual(env.wind_direction, 0)
+            switched = env.sample_wake_deficit(x, y)
+            self.assertAlmostEqual(switched[12, 24], east_wake, delta=0.1)
+            self.assertGreater(np.max(np.abs(switched - field)), 1)
+        finally:
+            env.close()
+
+    def test_wind_aligned_policy_tracks_local_wind_at_limited_rate(self):
+        scenario = WindScenario([0, 4, 8, 24, 36], [8] * 5, [359, 361, 405, 361, 361],
+                                mode="direction", direction_interpolation="step_hold")
+        env = WindFarmEnv(episode_length=9, layout=[(0, 0)])
         try:
             obs = env.reset(scenario=scenario, wind_aligned=True)
-            np.testing.assert_allclose(obs[:, 2], 0, atol=1e-8)
+            turbine = env.interface.wind_farm.turbines[0]
+            rates, yaws, powers = [], [], []
             for _ in range(env.episode_length):
-                previous = obs[:, 1]
+                expected_rate = np.clip(float(obs[0, 2]) / env.dt, -6, 6)
+                previous_heading = turbine.get_yaw_orientation()
                 obs, _, _, infos = env.step()
-                headings = [t.get_yaw_orientation() for t in env.interface.wind_farm.turbines]
-                np.testing.assert_allclose(obs[:, 2], 0, atol=1e-8)
-                np.testing.assert_allclose(headings, obs[:, 1], atol=2e-5, rtol=0)
-                expected = ((obs[:, 1] - previous + 180) % 360 - 180) / env.dt
-                np.testing.assert_allclose([info["yaw_rate_deg_s"] for info in infos], expected, atol=1e-5)
-            self.assertGreater(infos[0]["yaw_rate_deg_s"], 6)
+                rate = infos[0]["yaw_rate_deg_s"]
+                heading = turbine.get_yaw_orientation()
+                self.assertAlmostEqual(rate, expected_rate, places=6)
+                self.assertAlmostEqual(heading, (previous_heading + rate * env.dt) % 360)
+                ambient_yaw = (env.wind_direction - heading + 180) % 360 - 180
+                self.assertAlmostEqual(turbine.turbine_states.get_current_yaw(), ambient_yaw)
+                rates.append(rate)
+                yaws.append(float(obs[0, 2]))
+                powers.append(env._power)
 
-            env.reset(scenario=scenario)
-            obs, _, _, _ = env.step(np.zeros((2, 1)))
-            headings = [t.get_yaw_orientation() for t in env.interface.wind_farm.turbines]
-            np.testing.assert_allclose(headings, 359)
-            expected = (obs[:, 1] - 359 + 180) % 360 - 180
-            np.testing.assert_allclose(obs[:, 2], expected, atol=3e-5)
-            self.assertGreater(float(obs[0, 2]), 1.0)
+            self.assertEqual(max(rates), 6.0)
+            self.assertEqual(min(rates), -6.0)
+            self.assertGreater(yaws[1], 24.0)
+            self.assertLess(abs(yaws[4]), 1.0)
+            self.assertLess(yaws[5], -24.0)
+            self.assertLess(abs(yaws[-1]), 1.0)
+            self.assertLess(powers[1], powers[4])
+            self.assertLess(powers[5], powers[-1])
         finally:
             env.close()
 
